@@ -5,6 +5,7 @@ parent_dir = "coco/"
 
 def extract_categories(label_file: str, img_file: str):
     filename = parent_dir + label_file[2:]
+    print(f"{filename} check")
     if not os.path.exists(filename):
         return []
     file_lines = []
@@ -12,16 +13,20 @@ def extract_categories(label_file: str, img_file: str):
         for line in fp:
             cat = int(line.split()[0])
             print("cat:", cat)
-            if cat in {0, 80, 200, 201} or 14 <= cat <= 23:
-                if cat == 0: # person -> 0
+            if cat in {0, 200, 201, 202, 203} or 14 <= cat <= 23:
+                if cat == 0:  # person -> 0
                     new_cat = 0
-                elif cat == 14 or cat == 200: # bird -> 1
+                elif cat == 14 or cat == 200:  # bird -> 1
                     new_cat = 1
+                elif cat == 202:  # reptile
+                    new_cat = 3
+                elif cat == 203:  # amphibia
+                    new_cat = 4
                 else:
-                    new_cat = 2 # mammals -> 2
+                    new_cat = 2  # mammals -> 2
                 new_line = str(new_cat) + " " + " ".join(line.split(" ")[1:])
                 file_lines.append(new_line)
-    print("file_lines:", file_lines)
+    print(f"{filename} lines:", file_lines)
     if len(file_lines) <= 0:
         print("remove:", label_file[2:])
         try:
@@ -46,11 +51,11 @@ for index_file in ["train2017.txt", "val2017.txt"]:
     with open(parent_dir + index_file, "r") as fp:
         for line in fp:
             line = line.strip()
-            label_file = line.replace(
-                "images", "labels"
-            ).replace(
-                ".jpg", ".txt"
-            )
+            line = line.split("/")
+            line[1] = "labels"
+            line = "/".join(line)
+            print("line:", line)
+            label_file = line.replace(".jpg", ".txt")
             array = extract_categories(label_file, line)
             if array:
                 lines.append(line)
