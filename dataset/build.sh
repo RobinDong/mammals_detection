@@ -3,16 +3,16 @@ set -e
 
 # prepare coco
 rm -rf coco
-cp -r coco_backup coco
+cp -r ../../yolo_dataset/coco_backup coco
 
 # prepare mammals
-rm -rf yolotraing
-pbzip2 -dc yolotrain.tar.bz2 | tar x
+rm -rf yolotrain
+pbzip2 -dc ../../yolo_dataset/yolotrain.tar.bz2 | tar x
 # valid
-for file in `find yolotraing/mammal.dataset.v1.1/ yolotraing/amphibia.v1/ yolotraing/reptile.v1/ -name "*5.jpg" -type f`; do
+for file in `find yolotrain/mammal.dataset.v1.1/ yolotrain/amphibia.v1.1/ yolotrain/reptile.v1/ -name "*5.jpg" -type f`; do
   mv ${file} coco/images/val2017/
 done
-for file in `find yolotraing/mammal.dataset.v1.1/ yolotraing/amphibia.v1/ yolotraing/reptile.v1/ -name "*5.txt" -type f`; do
+for file in `find yolotrain/mammal.dataset.v1.1/ yolotrain/amphibia.v1.1/ yolotrain/reptile.v1/ -name "*5.txt" -type f`; do
   name="`basename ${file}`"
   # birds(0) -> 200
   # mammals(1) -> 201
@@ -23,10 +23,10 @@ for file in `find yolotraing/mammal.dataset.v1.1/ yolotraing/amphibia.v1/ yolotr
 done
 
 # train
-for file in `find yolotraing/mammal.dataset.v1.1/ yolotraing/amphibia.v1/ yolotraing/reptile.v1/ -name "*.jpg" -type f`; do
+for file in `find yolotrain/mammal.dataset.v1.1/ yolotrain/amphibia.v1.1/ yolotrain/reptile.v1/ -name "*.jpg" -type f`; do
   mv ${file} coco/images/train2017/
 done
-for file in `find yolotraing/mammal.dataset.v1.1/ yolotraing/amphibia.v1/ yolotraing/reptile.v1/ -name "*.txt" -type f`; do
+for file in `find yolotrain/mammal.dataset.v1.1/ yolotrain/amphibia.v1.1/ yolotrain/reptile.v1/ -name "*.txt" -type f`; do
   name="`basename ${file}`"
   # birds(0) -> 200
   # mammals(1) -> 201
