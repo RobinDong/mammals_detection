@@ -13,7 +13,7 @@ def extract_categories(label_file: str, img_file: str):
         for line in fp:
             cat = int(line.split()[0])
             print("cat:", cat)
-            if cat in {0, 200, 201, 202, 203} or 14 <= cat <= 23:
+            if cat in {0, 200, 201, 202, 203, 204} or 14 <= cat <= 23:
                 if cat == 0:  # person -> 0
                     new_cat = 0
                 elif cat == 14 or cat == 200:  # bird -> 1
@@ -22,10 +22,13 @@ def extract_categories(label_file: str, img_file: str):
                     new_cat = 3
                 elif cat == 203:  # amphibia
                     new_cat = 4
+                elif cat == 204:  # fish
+                    new_cat = 5
                 else:
                     new_cat = 2  # mammals -> 2
                 new_line = str(new_cat) + " " + " ".join(line.split(" ")[1:])
                 file_lines.append(new_line)
+
     print(f"{filename} lines:", file_lines)
     if len(file_lines) <= 0:
         print("remove:", label_file[2:])
