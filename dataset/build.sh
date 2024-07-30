@@ -19,8 +19,9 @@ done
 
 cp -r ../../BARM/V1.2.extra.20240523/B yolotrain/bird
 cp -r ../../BARM/V1.2.extra.20240523/F yolotrain/fish
+cp -r ../../BARM/extra.20240606-18fishes-461pangolins yolotrain/extra
 
-DIRS="yolotrain/mammal.dataset.v1.1/ yolotrain/amphibia.v1.1/ yolotrain/reptile.v1/ yolotrain/bird yolotrain/fish"
+DIRS="yolotrain/mammal.dataset.v1.1/ yolotrain/amphibia.v1.1/ yolotrain/reptile.v1/ yolotrain/bird yolotrain/fish yolotrain/extra"
 # valid
 for file in `find ${DIRS} -name "*5.jpg" -type f`; do
   mv ${file} coco/images/val2017/
