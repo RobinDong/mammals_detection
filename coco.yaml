@@ -13,7 +13,7 @@ train: train2017.txt  # train images (relative to 'path') 118287 images
 val: val2017.txt  # val images (relative to 'path') 5000 images
 test: test-dev2017.txt  # 20288 of 40670 images, submit to https://competitions.codalab.org/competitions/20794
 
-nc: 6
+nc: 8
 # Classes
 names:
   0: person
@@ -22,6 +22,8 @@ names:
   3: reptile
   4: amphibia
   5: fish
+  6: shrimp
+  7: others
 
 
 # Download script/URL (optional)
