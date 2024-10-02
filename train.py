@@ -1,10 +1,14 @@
 from ultralytics import YOLO
 
 # Load a model
-#model = YOLO('yolov8m.pt')
-model = YOLO('runs/detect/train3/weights/best.pt')
-#model = YOLO('yolov8n.pt')  # load a pretrained model (recommended for training)
-#model = YOLO('yolov8n.yaml').load('yolov8n.pt')  # build from YAML and transfer weights
+# model = YOLO('yolov8m.pt')
+model = YOLO("/media/data2/sanbai/mammals_detection/runs/detect/train5/weights/last.pt")
+# model = YOLOv10.from_pretrained("jameslahm/yolov10m")
+# model = YOLOv10("/media/data2/sanbai/yolov10/runs/detect/train3/weights/last.pt")
 
 # Train the model
-results = model.train(data='coco.yaml', epochs=600, batch=12, imgsz=800, resume=True)
+# results = model.train(data='coco.yaml', epochs=600, batch=20, imgsz=640, save_period=2, resume=True, cache=False, device=0)
+results = model.train(data='coco.yaml', epochs=600, batch=20, imgsz=640, save_period=2, resume=True, device=0, cache=False)
+
+model.export(format="onnx", half=True)
+model.export(format="openvino", imgsz=640, **{"int8": True, "data": "coco.yaml"})
