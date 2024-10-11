@@ -1,0 +1,150 @@
+coco_source: "/media/data2/sanbai/yolo_dataset/coco_backup"
+hero_source:
+  - name: bird
+    path: 
+      - "/media/data2/tetrapod/yolotraining/V1.2.extra.20240523/B"
+      - "/media/data2/tetrapod/yolotraining/birds.video.20240727"
+    src_tag: 0
+    dest_tag: 1
+  - name: mammal
+    path: 
+      - "/media/data2/tetrapod/yolotraining/V1.2.extra.20240523/M"
+      - "/media/data2/tetrapod/yolotraining/mammal.dataset.v1.1"
+    src_tag: 1
+    dest_tag: 2
+  - name: reptile
+    path: 
+      - "/media/data2/tetrapod/yolotraining/V1.2.extra.20240523/R"
+      - "/media/data2/tetrapod/yolotraining/reptile.v1"
+    src_tag: 2
+    dest_tag: 3
+  - name: amphibia
+    path:
+      - "/media/data2/tetrapod/yolotraining/V1.2.extra.20240523/A"
+      - "/media/data2/tetrapod/yolotraining/amphibia.v1.1"
+    src_tag: 3
+    dest_tag: 4
+  - name: fish
+    path:
+      - "/media/data2/tetrapod/yolotraining/fish.v1.20240525"
+    src_tag: 4
+    dest_tag: 5
+  - name: shrimp
+    path:
+      - "/media/data2/tetrapod/yolotraining/shrimpandcrab.V1.20240724"
+    src_tag: 5
+    dest_tag: 6
+  - name: others
+    path:
+      - "/media/data2/tetrapod/yolotraining/shrimpandcrab.V1.20240724"
+    src_tag: 6
+    dest_tag: 7
+open_image_source:
+  path: "/media/data2/sanbai/open-images-v7"
+  tag_map:
+    "/m/0d_2m": 8  # Moths and butterflies
+    "/m/0c9ph5": 9  # Flower
+    "/m/03vt0": 10  # Insect
+    "/m/052sf": 11  # Mushroom
+    "/m/0d8zb": 12  # Jellyfish
+    "/m/02xwb": 13  # Fruit
+    "/m/0n28_": 14  # Crab
+    "/m/0cydv": 10  # Caterpillar
+    "/m/011k07": 3  # Tortoise
+    "/m/012074": 1  # Magpie
+    "/m/0120dh": 3  # Sea turtle
+    "/m/014j1m": 13 # Apple
+    "/m/015p6": 1   # Bird
+    "/m/01dws": 2   # Bear
+    "/m/01dxs": 2   # Brown bear
+    "/m/01dy8n": 1  # Woodpecker
+    "/m/01f8m5": 1  # Blue jay
+    "/m/01h3n": 10  # Bee
+    "/m/01h44": 2   # Bat
+    "/m/01xq0k1": 2 # Cattle
+    "/m/01x_v": 2   # Camel
+    "/m/01yrx": 2   # Cat
+    "/m/020jm": 10  # Beetle
+    "/m/029tx": 3   # Dinosaur
+    "/m/02hj4": 2   # Dolphin
+    "/m/02l8p9": 2  # Harbor seal
+    "/m/0306r": 2   # Fox
+    "/m/0388q": 13  # Grape
+    "/m/03bj1": 2   # Panda
+    "/m/03bk1": 2   # Giraffe
+    "/m/03d443": 2  # Rhinoceros
+    "/m/03fj2": 5   # Goldfish
+    "/m/03fwl": 2   # Goat
+    "/m/03k3r": 2   # Horse
+    "/m/0449p": 2   # Jaguar
+    "/m/04c0y": 2   # Kangaroo
+    "/m/04cp_": 2   # Koala
+    "/m/04g2r": 2   # Lynx
+    "/m/04rky": 2   # Mammal
+    "/m/04rmv": 2   # Mouse
+    "/m/05z6w": 1   # Penguin
+    "/m/061_f": 13  # Pear
+    "/m/0633h": 2   # Polar bear
+    "/m/068zj": 2   # Pig
+    "/m/06bt6": 3   # Reptile
+    "/m/06j2d": 1   # Raven
+    "/m/06l9r": 2   # Red panda
+    "/m/06mf6": 2   # Rabbit
+    "/m/071qp": 2   # Squirrel
+    "/m/0755b": 10  # Scorpion
+    "/m/07bgp": 2   # Sheep
+    "/m/07dm6": 2   # Tiger
+    "/m/07fbm7": 13 # Strawberry
+    "/m/07j87": 13  # Tomato
+    "/m/084zz": 2   # Whale
+    "/m/0898b": 2   # Zebra
+    "/m/08pbxl": 2  # Monkey
+    "/m/096mb": 2   # Lion
+    "/m/09b5t": 1   # Chicken
+    "/m/09csl": 1   # Eagle
+    "/m/09d5_": 1   # Owl
+    "/m/09ddx": 1   # Duck
+    "/m/09dzg": 3   # Turtle
+    "/m/09f20": 2   # Hippopotamus
+    "/m/09f_2": 3   # Crocodile
+    "/m/09k_b": 13  # Lemon
+    "/m/09kmb": 10  # Spider
+    "/m/09kx5": 2   # Deer
+    "/m/09ld4": 4   # Frog
+    "/m/09qck": 13  # Banana
+    "/m/0bt9lr": 2  # Dog
+    "/m/0bwd_0j": 2 # Elephant
+    "/m/0by6g": 5   # Shark
+    "/m/0c29q": 2   # Leopard
+    "/m/0ccs93": 1  # Canary
+    "/m/0cd4d": 2   # Cheetah
+    "/m/0ch_cf": 5  # Fish
+    "/m/0cjq5": 6   # Lobster
+    "/m/0cn6p": 2   # Otter
+    "/m/0cnyhnx": 2 # Bull
+    "/m/0cyf8": 8   # Butterfly
+    "/m/0cyhj_": 13 # Orange
+    "/m/0dbvp": 1   # Goose
+    "/m/0dbzx": 2   # Mule
+    "/m/0dftk": 1   # Swan
+    "/m/0dj6p": 13  # Peach
+    "/m/0dq75": 2   # Raccoon
+    "/m/0fldg": 13  # Mango
+    "/m/0fp6w": 13  # Pineapple
+    "/m/0ft9s": 10  # Dragonfly
+    "/m/0ftb8": 9   # Common sunflower
+    "/m/0gd2v": 2   # Marine mammal
+    "/m/0gd36": 2   # Sea lion
+    "/m/0gv1x": 1   # Parrot
+    "/m/0h23m": 1   # Sparrow
+    "/m/0hqkz": 13  # Grapefruit
+    "/m/0jly": 1    # Turkey
+    "/m/0jqgx": 9   # Lily
+    "/m/0_k2": 10   # Ant
+    "/m/0km7z": 2   # Skunk
+    "/m/0kpqd": 13  # Watermelon
+    "/m/0kpt_": 13  # Cantaloupe
+    "/m/0ll1f78": 6 # Shrimp
+    "/m/0nybt": 5   # Seahorse
+    "/m/0pcr": 2    # Alpaca
+    "/m/0xfy": 2    # Armadillo
