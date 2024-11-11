@@ -128,7 +128,7 @@ def extract_hero(pathes, tag_map):
 def extract_open_image(data_source, prefix, coco_prefix):
     path = data_source["path"]
     img_lst = glob.glob(path + f"/{prefix}/data/*.jpg")
-    print(f"Number of images: {len(img_lst)}")
+    print(f"Number of images for {prefix}: {len(img_lst)}")
     img_set = {os.path.basename(fname)[:-4] for fname in img_lst}  # without ".jpg"
 
     df = pv.read_csv(path + f"/{prefix}/labels/detections.csv").to_pandas()
@@ -157,7 +157,6 @@ def extract_open_image(data_source, prefix, coco_prefix):
         cat_name[row[0]] = row[1]
 
     for id, coordinates in id_coord_map.items():
-        print("id:", id)
         if not coordinates:
             continue
         # Copy image file
@@ -171,7 +170,6 @@ def extract_open_image(data_source, prefix, coco_prefix):
         with open(label_file, "w") as fp:
             for coord in coordinates:
                 fp.write(f"{coord}\n")
-        break
 
     # Statistics report
     arr = sorted(
@@ -200,23 +198,23 @@ def build_dataset():
     with open("consolidate.yml", "r") as fp:
         obj = yaml.safe_load(fp)
 
-    """res = copy_coco()
+    res = copy_coco()
     if not res:
         print("Failed to copy COCO!")
-        return"""
+        return
     # By using clear_coco/, we don't need to do clear_coco() again
     # clear_coco()
 
     # build mapping of "src_tag" -> "dest_tag"
-    """tag_map = {str(cat["src_tag"]): str(cat["dest_tag"]) for cat in obj["hero_source"]}
+    tag_map = {str(cat["src_tag"]): str(cat["dest_tag"]) for cat in obj["hero_source"]}
 
     # Extract images/labels from dataset created by hero.jianmei
     for cat in obj["hero_source"]:
-        extract_hero(cat["path"], tag_map)"""
+        extract_hero(cat["path"], tag_map)
 
     # Extract images/labels from part of open-image-v7
     for prefix, coco_prefix in [("train", "train"), ("validation", "val")]:
-        extract_open_image(obj["open_image_source"], prefix)
+        extract_open_image(obj["open_image_source"], prefix, coco_prefix)
 
 
 if __name__ == "__main__":
