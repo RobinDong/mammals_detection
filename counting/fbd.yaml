@@ -1,0 +1,6 @@
+path: /data/fbd/
+train: train.txt
+val: val.txt
+
+names:
+  0: bird
