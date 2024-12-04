@@ -36,7 +36,7 @@ def main(path):
     model = YOLO("yolov8x-seg.pt")
     img = cv2.imread(path)
 
-    results = model(img, imgsz=(img.shape[1], img.shape[0]))
+    results = model(img, imgsz=2048, conf=0.2)
 
     index = 0
     boxes = []
