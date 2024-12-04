@@ -1,0 +1,6 @@
+path: /data/bird_images/
+train: train.txt
+val: val.txt
+
+names:
+  0: bird

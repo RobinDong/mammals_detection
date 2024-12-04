@@ -6,7 +6,7 @@ model = YOLO('yolov8l.pt')
 
 # Train the model
 # results = model.train(data='coco.yaml', epochs=600, batch=20, imgsz=640, save_period=2, resume=True, cache=False, device=0)
-results = model.train(data='fbd.yaml', epochs=600, batch=24, imgsz=800, save_period=2, resume=False, device=0, cache=False)
+results = model.train(data='coco.yaml', epochs=600, batch=16, imgsz=1024, save_period=2, resume=False, device=0, cache=False)
 
 model.export(format="onnx", int8=True)
 model.export(format="openvino", imgsz=640, **{"int8": True, "data": "coco.yaml"})
