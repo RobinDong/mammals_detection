@@ -1,14 +1,15 @@
 from ultralytics import YOLO
 
 
-best_model = YOLO("yolov8m_800_20240202_int8.onnx")
+#best_model = YOLO("runs/detect/train-15/weights/best.pt")
+best_model = YOLO("runs/detect/train-15/weights/best_int8.onnx")
 
 val_metrics = best_model.val(
-    data="robin_old.yaml",
+    data="robin_extra.yaml",
     split="val",
     imgsz=640,
     batch=1,
-    device="cpu",
+    device=[0, 1],
     plots=True,
 )
 
