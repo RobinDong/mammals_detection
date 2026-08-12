@@ -2,9 +2,14 @@
 from __future__ import annotations
 
 import argparse
+import os
 import random
 import re
 from pathlib import Path
+
+# onnxruntime-gpu already provides the onnxruntime module.  Prevent Ultralytics'
+# requirement checker from replacing it with the CPU-only onnxruntime wheel.
+os.environ.setdefault("YOLO_AUTOINSTALL", "false")
 
 import cv2
 import numpy as np
@@ -18,13 +23,13 @@ from onnxruntime.quantization import (
     QuantType,
     quantize_static,
 )
-from ultralytics import YOLO
+from ultralytics import YOLO, __version__ as ULTRALYTICS_VERSION
 from ultralytics.data.augment import LetterBox
 
 
-DEFAULT_MODEL = "runs/detect/train-15/weights/best.pt"
+DEFAULT_MODEL = "runs/detect/yolo26l_scratch_768/weights/best.pt"
 DEFAULT_DATA = "robin_extra.yaml"
-DEFAULT_IMGSZ = 640
+DEFAULT_IMGSZ = None
 DEFAULT_CALIBRATION_IMAGES = 1000
 DEFAULT_VERIFY_IMAGES = 100
 DEFAULT_VERIFY_CONF = 0.05
@@ -119,14 +124,98 @@ def choose_verification_images(
     return image_paths[: min(count, len(image_paths))]
 
 
+def resolve_export_imgsz(model_path: Path, requested_imgsz: int | None) -> int:
+    """Use an explicit size, otherwise preserve the training size stored in a PT checkpoint."""
+    if requested_imgsz is not None:
+        return requested_imgsz
+    if model_path.suffix.lower() != ".pt":
+        raise ValueError("--imgsz is required when --model is not a .pt checkpoint")
+
+    checkpoint_imgsz = YOLO(str(model_path)).overrides.get("imgsz")
+    if not isinstance(checkpoint_imgsz, int) or checkpoint_imgsz < 1:
+        raise RuntimeError(f"Could not infer a valid training imgsz from {model_path}; pass --imgsz explicitly")
+    print(f"Using checkpoint training image size: {checkpoint_imgsz}")
+    return checkpoint_imgsz
+
+
+def get_static_onnx_input_hw(onnx_path: Path) -> tuple[int, int] | None:
+    """Return the fixed ONNX input height/width, or None for a dynamic/unknown input."""
+    model = onnx.load(str(onnx_path), load_external_data=False)
+    if not model.graph.input:
+        return None
+    dims = model.graph.input[0].type.tensor_type.shape.dim
+    if len(dims) < 4 or not dims[-2].dim_value or not dims[-1].dim_value:
+        return None
+    return int(dims[-2].dim_value), int(dims[-1].dim_value)
+
+
+def get_static_onnx_output_shape(onnx_path: Path) -> tuple[int, ...] | None:
+    """Return the first fixed ONNX output shape, or None when any dimension is dynamic."""
+    model = onnx.load(str(onnx_path), load_external_data=False)
+    if not model.graph.output:
+        return None
+    dims = model.graph.output[0].type.tensor_type.shape.dim
+    if not dims or any(not dim.dim_value for dim in dims):
+        return None
+    return tuple(int(dim.dim_value) for dim in dims)
+
+
+def get_onnx_metadata(onnx_path: Path) -> dict[str, str]:
+    """Return ONNX metadata without loading external tensor data."""
+    model = onnx.load(str(onnx_path), load_external_data=False)
+    return {item.key: item.value for item in model.metadata_props}
+
+
+def restore_checkpoint_end2end_mode(model: YOLO) -> bool:
+    """Restore YOLO26's class-level end2end flag, which is not serialized as an instance attribute."""
+    expected_end2end = bool(model.model.yaml.get("end2end", False))
+    if not expected_end2end:
+        return False
+
+    detect_head = model.model.model[-1]
+    if not hasattr(detect_head, "one2one_cv2") or not hasattr(detect_head, "one2one_cv3"):
+        raise RuntimeError("Checkpoint declares end2end=True but its Detect head has no one-to-one branches")
+    if not detect_head.end2end:
+        print("Restoring end-to-end Detect mode from checkpoint YAML")
+    detect_head.end2end = True
+    return True
+
+
 def export_fp32_onnx(model_path: Path, imgsz: int, simplify: bool, force: bool) -> Path:
     fp32_path = model_path.with_suffix(".onnx")
+    export_model = YOLO(str(model_path))
+    checkpoint_version = str(getattr(export_model, "ckpt", {}).get("version", "")).strip()
+    if checkpoint_version and checkpoint_version != ULTRALYTICS_VERSION:
+        raise RuntimeError(
+            f"Checkpoint was trained with ultralytics {checkpoint_version}, but the active environment has "
+            f"{ULTRALYTICS_VERSION}. Install the checkpoint version before exporting: "
+            f"python3 -m pip install --no-deps ultralytics=={checkpoint_version}"
+        )
+    expected_end2end = restore_checkpoint_end2end_mode(export_model)
     if fp32_path.exists() and not force:
-        print(f"Using existing FP32 ONNX: {fp32_path}")
-        return fp32_path
+        input_hw = get_static_onnx_input_hw(fp32_path)
+        output_shape = get_static_onnx_output_shape(fp32_path)
+        onnx_version = get_onnx_metadata(fp32_path).get("version")
+        source_is_current = fp32_path.stat().st_mtime >= model_path.stat().st_mtime
+        output_mode_is_current = not expected_end2end or (output_shape is not None and output_shape[-1] == 6)
+        exporter_version_is_current = not checkpoint_version or onnx_version == checkpoint_version
+        if input_hw == (imgsz, imgsz) and source_is_current and output_mode_is_current and exporter_version_is_current:
+            print(f"Using existing FP32 ONNX: {fp32_path} (input {imgsz}x{imgsz})")
+            return fp32_path
+
+        reasons = []
+        if input_hw != (imgsz, imgsz):
+            reasons.append(f"input is {input_hw}, expected {(imgsz, imgsz)}")
+        if not source_is_current:
+            reasons.append("checkpoint is newer than ONNX")
+        if not output_mode_is_current:
+            reasons.append(f"output is {output_shape}, expected end-to-end (..., 6)")
+        if not exporter_version_is_current:
+            reasons.append(f"exporter version is {onnx_version!r}, expected {checkpoint_version!r}")
+        print(f"Re-exporting stale/incompatible FP32 ONNX: {fp32_path} ({'; '.join(reasons)})")
 
     print(f"Exporting FP32 ONNX from {model_path}")
-    exported = YOLO(str(model_path)).export(
+    exported = export_model.export(
         format="onnx",
         imgsz=imgsz,
         simplify=simplify,
@@ -338,7 +427,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Input .pt model.")
     parser.add_argument("--data", default=DEFAULT_DATA, help="Ultralytics data yaml used for calibration images.")
     parser.add_argument("--split", default="val", help="Dataset split used for calibration.")
-    parser.add_argument("--imgsz", type=int, default=DEFAULT_IMGSZ)
+    parser.add_argument(
+        "--imgsz",
+        type=int,
+        default=DEFAULT_IMGSZ,
+        help="Export/calibration image size. Defaults to the training size stored in a .pt checkpoint.",
+    )
     parser.add_argument("--calib-images", type=int, default=DEFAULT_CALIBRATION_IMAGES)
     parser.add_argument("--seed", type=int, default=20260707)
     parser.add_argument("--output", default=None, help="Output INT8 ONNX path.")
@@ -374,9 +468,10 @@ def main() -> None:
         raise ValueError("--min-match-recall must be between 0 and 1")
     model_path = Path(args.model)
     data_yaml = Path(args.data)
+    imgsz = resolve_export_imgsz(model_path, args.imgsz)
     fp32_path = export_fp32_onnx(
         model_path,
-        imgsz=args.imgsz,
+        imgsz=imgsz,
         simplify=not args.no_simplify,
         force=args.force_fp32_export,
     )
@@ -405,13 +500,13 @@ def main() -> None:
             fp32_path=fp32_path,
             int8_path=candidate_path,
             calibration_images=calibration_images,
-            imgsz=args.imgsz,
+            imgsz=imgsz,
             quant_format=args.quant_format,
             activation_type=args.activation_type,
             quantize_detect_head=args.quantize_detect_head,
         )
 
-        score_max, nonzero_scores, output_shape = smoke_test(candidate_path, verification_images[0], args.imgsz)
+        score_max, nonzero_scores, output_shape = smoke_test(candidate_path, verification_images[0], imgsz)
         print(f"Smoke test output_shape={output_shape} score_max={score_max:.6g} nonzero_scores={nonzero_scores}")
         if score_max <= 0.0 or nonzero_scores == 0:
             raise RuntimeError("INT8 export produced zero class scores. Do not use this ONNX file.")
@@ -419,7 +514,7 @@ def main() -> None:
             fp32_path=fp32_path,
             int8_path=candidate_path,
             image_paths=verification_images,
-            imgsz=args.imgsz,
+            imgsz=imgsz,
             conf=args.verify_conf,
             min_match_recall=args.min_match_recall,
         )
