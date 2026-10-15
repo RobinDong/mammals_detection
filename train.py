@@ -1,7 +1,11 @@
 import math
 import os
+from pathlib import Path
 
-import albumentations as A
+try:
+    import albumentations as A
+except ImportError:
+    A = None
 import cv2
 import numpy as np
 import torch
@@ -17,28 +21,38 @@ RARE_CLASS_ID = 7  # others
 HARD_NEGATIVE_CLASS_ID = 6  # shrimp: the dominant source of others false positives
 RARE_IMAGE_FRACTION = 0.002
 HARD_NEGATIVE_IMAGE_FRACTION = 0.08
+SEAHORSE_IMAGE_FRACTION = 0.01
+SEAHORSE_TRAIN_ROOT = "/data/seahorse/images/train/"
 
 
 def class_group_sample_weights(
     labels,
+    image_files,
     rare_class_id,
     hard_negative_class_id,
     rare_fraction,
     hard_negative_fraction,
+    seahorse_fraction,
 ):
-    """Assign exact probability mass to rare, hard-negative, and other images."""
-    common_fraction = 1.0 - rare_fraction - hard_negative_fraction
-    if min(rare_fraction, hard_negative_fraction, common_fraction) <= 0.0:
-        raise ValueError("rare, hard-negative, and common sampling fractions must all be positive")
+    """Assign probability mass to rare, shrimp, seahorse, and other images."""
+    common_fraction = 1.0 - rare_fraction - hard_negative_fraction - seahorse_fraction
+    if min(rare_fraction, hard_negative_fraction, seahorse_fraction, common_fraction) <= 0.0:
+        raise ValueError("All sampling fractions must be positive")
 
     classes = [np.asarray(label["cls"], dtype=np.int64).reshape(-1) for label in labels]
+    if len(classes) != len(image_files):
+        raise ValueError("Labels and image paths have different lengths")
     rare_mask = np.asarray([rare_class_id in cls for cls in classes], dtype=bool)
     # Mixed rare/shrimp images belong to the rare group so every rare image is retained.
     hard_negative_mask = np.asarray(
         [hard_negative_class_id in cls for cls in classes], dtype=bool
     ) & ~rare_mask
-    common_mask = ~(rare_mask | hard_negative_mask)
-    group_masks = (rare_mask, hard_negative_mask, common_mask)
+    seahorse_mask = np.asarray(
+        [os.path.abspath(path).startswith(SEAHORSE_TRAIN_ROOT) for path in image_files],
+        dtype=bool,
+    ) & ~(rare_mask | hard_negative_mask)
+    common_mask = ~(rare_mask | hard_negative_mask | seahorse_mask)
+    group_masks = (rare_mask, hard_negative_mask, seahorse_mask, common_mask)
     group_counts = tuple(int(mask.sum()) for mask in group_masks)
     if any(count == 0 for count in group_counts):
         raise RuntimeError(f"Empty sampling group: counts={group_counts}")
@@ -47,7 +61,7 @@ def class_group_sample_weights(
     for mask, count, fraction in zip(
         group_masks,
         group_counts,
-        (rare_fraction, hard_negative_fraction, common_fraction),
+        (rare_fraction, hard_negative_fraction, seahorse_fraction, common_fraction),
         strict=True,
     ):
         weights[mask] = fraction / count
@@ -75,10 +89,12 @@ class ScratchTrainer(DetectionTrainer):
 
         weights, group_counts = class_group_sample_weights(
             dataset.labels,
+            dataset.im_files,
             rare_class_id=RARE_CLASS_ID,
             hard_negative_class_id=HARD_NEGATIVE_CLASS_ID,
             rare_fraction=RARE_IMAGE_FRACTION,
             hard_negative_fraction=HARD_NEGATIVE_IMAGE_FRACTION,
+            seahorse_fraction=SEAHORSE_IMAGE_FRACTION,
         )
         samples = len(dataset)
         sampler_generator = torch.Generator().manual_seed(int(self.args.seed))
@@ -97,16 +113,20 @@ class ScratchTrainer(DetectionTrainer):
         loader_generator = torch.Generator().manual_seed(6148914691236517205)
         LOGGER.info(
             "Class-group sampling: others=%d (%.2f%%), shrimp hard negatives=%d (%.1f%%), "
-            "other=%d (%.1f%%), samples/epoch=%d; expected others/shrimp=%d/%d",
+            "seahorse=%d (%.1f%%), other=%d (%.1f%%), samples/epoch=%d; "
+            "expected others/shrimp/seahorse=%d/%d/%d",
             group_counts[0],
             100 * RARE_IMAGE_FRACTION,
             group_counts[1],
             100 * HARD_NEGATIVE_IMAGE_FRACTION,
             group_counts[2],
-            100 * (1.0 - RARE_IMAGE_FRACTION - HARD_NEGATIVE_IMAGE_FRACTION),
+            100 * SEAHORSE_IMAGE_FRACTION,
+            group_counts[3],
+            100 * (1.0 - RARE_IMAGE_FRACTION - HARD_NEGATIVE_IMAGE_FRACTION - SEAHORSE_IMAGE_FRACTION),
             samples,
             round(samples * RARE_IMAGE_FRACTION),
             round(samples * HARD_NEGATIVE_IMAGE_FRACTION),
+            round(samples * SEAHORSE_IMAGE_FRACTION),
         )
         return InfiniteDataLoader(
             dataset=dataset,
@@ -194,7 +214,7 @@ targeted_augmentations = [
         ],
         p=0.20,
     ),
-]
+] if A is not None else []
 
 
 def main():
@@ -202,7 +222,7 @@ def main():
     model = YOLO("yolo26l.yaml")
     return model.train(
         trainer=ScratchTrainer,
-        data="robin_extra.yaml",
+        data=str(Path(__file__).resolve().with_name("robin_extra_seahorse.yaml")),
         name="yolo26l_scratch_768",
         epochs=200,
         patience=40,
