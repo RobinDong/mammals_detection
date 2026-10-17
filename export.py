@@ -28,7 +28,7 @@ from ultralytics.data.augment import LetterBox
 
 
 DEFAULT_MODEL = "runs/detect/yolo26l_scratch_768/weights/best.pt"
-DEFAULT_DATA = "robin_extra.yaml"
+DEFAULT_DATA = "robin_extra_seahorse.yaml"
 DEFAULT_IMGSZ = None
 DEFAULT_CALIBRATION_IMAGES = 1000
 DEFAULT_VERIFY_IMAGES = 100
@@ -43,28 +43,34 @@ def resolve_split_paths(data_yaml: Path, split: str) -> list[Path]:
     if not dataset_root.is_absolute():
         dataset_root = (data_yaml.parent / dataset_root).resolve()
 
-    split_spec = cfg[split]
-    split_path = Path(split_spec)
-    if not split_path.is_absolute():
-        split_path = dataset_root / split_path
+    split_specs = cfg[split]
+    if not isinstance(split_specs, list):
+        split_specs = [split_specs]
 
-    if split_path.is_file():
-        paths = []
-        for line in split_path.read_text().splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            image_path = Path(line)
-            if not image_path.is_absolute():
-                image_path = dataset_root / image_path
-            paths.append(image_path.resolve())
-        return [p for p in paths if p.exists()]
+    paths = []
+    for split_spec in split_specs:
+        split_path = Path(split_spec)
+        if not split_path.is_absolute():
+            split_path = dataset_root / split_path
 
-    if split_path.is_dir():
-        suffixes = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-        return sorted(p.resolve() for p in split_path.rglob("*") if p.suffix.lower() in suffixes)
-
-    raise FileNotFoundError(f"Could not resolve {split!r} split from {data_yaml}: {split_path}")
+        if split_path.is_file():
+            for line in split_path.read_text().splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                image_path = Path(line)
+                if not image_path.is_absolute():
+                    image_path = split_path.parent / image_path
+                if image_path.exists():
+                    paths.append(image_path.resolve())
+        elif split_path.is_dir():
+            suffixes = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+            paths.extend(sorted(
+                p.resolve() for p in split_path.rglob("*") if p.suffix.lower() in suffixes
+            ))
+        else:
+            raise FileNotFoundError(f"Could not resolve {split!r} split from {data_yaml}: {split_path}")
+    return paths
 
 
 def preprocess_image(image_path: Path, imgsz: int) -> np.ndarray | None:
