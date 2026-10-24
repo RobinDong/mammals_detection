@@ -56,3 +56,37 @@ Run integration tests in the yolo environment:
 ```bash
 python3 -m unittest discover -s tests -v
 ```
+
+## Accuracy-checked INT8 ONNX export
+
+```bash
+conda activate yolo
+python3 export.py
+python3 test.py
+```
+
+The export defaults to `yolo26l_finetune_texture_v2-2/weights/best.pt` and its
+stored image size (896). Pass `--model` and `--imgsz` to change them. The output
+is a fixed square, batch-1 ONNX. Calibration now uses 512 deterministic,
+class-stratified **training** images, separate from validation. The first five
+YOLO modules (0–4) and the Detect head remain FP32; the other convolution
+weights/activations use per-channel-weight U8/S8 QDQ quantization with MinMax
+calibration. This is a mixed-precision INT8 model, not an all-INT8 network.
+
+Before replacing an output, the exporter runs the FP32 and INT8 ONNX models on
+the **same complete validation split**, with identical square inputs, batch 1,
+FP32 input tensors and detection thresholds. It rejects exports losing more
+than 0.003 overall mAP50–95, or 0.005 in any class's mAP50 or mAP50–95 (absolute
+units: 0.005 means 0.5 percentage points). A failure leaves the previous output
+untouched. `*.accuracy.json` records model hashes, calibration image paths,
+validation settings and accuracy results; rejected runs save
+`*.rejected.accuracy.json`. Full validation takes several minutes on the 4090.
+`--skip-map-check` explicitly bypasses this check and marks the report as
+accuracy-unverified. GPU calibration/validation is selected automatically when
+available; use `--device cpu` for CPU execution.
+
+`test.py` now uses `robin_extra_seahorse.yaml`, matching training's 18,981-image
+validation set, with `rect=False` and `half=False`. Compare PT and ONNX with
+these same settings: training's rectangular validation and a fixed square
+ONNX input are different evaluation conditions. These accuracy checks measure
+this validation distribution, not robustness to every new photo.

@@ -4,7 +4,7 @@ import onnx
 from ultralytics import YOLO
 
 
-MODEL_PATH = Path("runs/detect/yolo26l_scratch_768/weights/best_int8.onnx")
+MODEL_PATH = Path("runs/detect/yolo26l_finetune_texture_v2-2/weights/best_int8.onnx")
 
 
 def resolve_validation_imgsz(model_path: Path, model: YOLO) -> int:
@@ -30,10 +30,12 @@ best_model = YOLO(str(MODEL_PATH))
 validation_imgsz = resolve_validation_imgsz(MODEL_PATH, best_model)
 
 val_metrics = best_model.val(
-    data="robin_extra.yaml",
+    data="robin_extra_seahorse.yaml",
     split="val",
     imgsz=validation_imgsz,
     batch=1,
+    rect=False,
+    half=False,
     device=0,
     plots=True,
 )

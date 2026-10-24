@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import random
 import re
+import tempfile
 from pathlib import Path
 
 # onnxruntime-gpu already provides the onnxruntime module.  Prevent Ultralytics'
@@ -16,6 +19,7 @@ import numpy as np
 import onnx
 import onnxruntime as ort
 import yaml
+import torch
 from onnxruntime.quantization import (
     CalibrationDataReader,
     CalibrationMethod,
@@ -27,14 +31,15 @@ from ultralytics import YOLO, __version__ as ULTRALYTICS_VERSION
 from ultralytics.data.augment import LetterBox
 
 
-DEFAULT_MODEL = "runs/detect/yolo26l_scratch_768/weights/best.pt"
+DEFAULT_MODEL = "runs/detect/yolo26l_finetune_texture_v2-2/weights/best.pt"
 DEFAULT_DATA = "robin_extra_seahorse.yaml"
 DEFAULT_IMGSZ = None
-DEFAULT_CALIBRATION_IMAGES = 1000
+DEFAULT_CALIBRATION_IMAGES = 512
 DEFAULT_VERIFY_IMAGES = 100
 DEFAULT_VERIFY_CONF = 0.05
 DEFAULT_MIN_MATCH_RECALL = 0.90
 MODEL_NODE_PATTERN = re.compile(r"^/model\.(\d+)(?:/|$)")
+DEFAULT_FP32_MODULES = (0, 1, 2, 3, 4)
 
 
 def resolve_split_paths(data_yaml: Path, split: str) -> list[Path]:
@@ -70,7 +75,7 @@ def resolve_split_paths(data_yaml: Path, split: str) -> list[Path]:
             ))
         else:
             raise FileNotFoundError(f"Could not resolve {split!r} split from {data_yaml}: {split_path}")
-    return paths
+    return list(dict.fromkeys(paths))
 
 
 def preprocess_image(image_path: Path, imgsz: int) -> np.ndarray | None:
@@ -102,14 +107,41 @@ class YoloCalibrationReader(CalibrationDataReader):
         return None
 
 
+def stratified_sample(image_paths: list[Path], count: int, seed: int, nc: int) -> list[Path]:
+    """Sample each label class, then fill unused slots; never duplicate an image."""
+    paths = list(dict.fromkeys(image_paths))
+    random.Random(seed).shuffle(paths)
+    quota = max(1, count // nc)
+    groups = [[] for _ in range(nc)]
+    for path in paths:
+        label = Path(str(path).replace('/images/', '/labels/')).with_suffix('.txt')
+        classes = {int(line.split()[0]) for line in label.read_text().splitlines() if line.strip()} if label.exists() else set()
+        for cls in classes:
+            if not 0 <= cls < nc:
+                raise ValueError(f"Invalid class {cls} in {label}")
+            if len(groups[cls]) < quota:
+                groups[cls].append(path)
+        if all(len(group) >= quota for group in groups):
+            break
+    selected = list(dict.fromkeys(path for group in groups for path in group))
+    seen = set(selected)
+    for path in paths:
+        if len(selected) >= count:
+            break
+        if path not in seen:
+            selected.append(path)
+            seen.add(path)
+    random.Random(seed + 1).shuffle(selected)
+    return selected[:count]
+
+
 def choose_calibration_images(data_yaml: Path, split: str, count: int, seed: int) -> list[Path]:
     image_paths = resolve_split_paths(data_yaml, split)
     if not image_paths:
         raise RuntimeError(f"No calibration images found in {data_yaml} split={split!r}")
 
-    rng = random.Random(seed)
-    rng.shuffle(image_paths)
-    return image_paths[: min(count, len(image_paths))]
+    cfg = yaml.safe_load(data_yaml.read_text())
+    return stratified_sample(image_paths, count, seed, len(cfg['names']))
 
 
 def choose_verification_images(
@@ -283,18 +315,32 @@ def quantize_conv_only(
     quant_format: str,
     activation_type: str,
     quantize_detect_head: bool,
+    fp32_modules: tuple[int, ...] = DEFAULT_FP32_MODULES,
+    calibration_providers: list[str] | None = None,
 ) -> None:
-    session = ort.InferenceSession(str(fp32_path), providers=["CPUExecutionProvider"])
-    input_name = session.get_inputs()[0].name
+    graph = onnx.load(str(fp32_path), load_external_data=False).graph
+    input_name = graph.input[0].name
     reader = YoloCalibrationReader(calibration_images, input_name, imgsz)
     qformat = QuantFormat.QDQ if quant_format == "qdq" else QuantFormat.QOperator
     detect_nodes, conv_count, detect_index = find_detect_head_conv_nodes(fp32_path)
-    excluded_nodes = [] if quantize_detect_head else detect_nodes
+    available_modules = {
+        int(match.group(1)) for node in graph.node if node.op_type == 'Conv'
+        and (match := MODEL_NODE_PATTERN.match(node.name))
+    }
+    if missing := set(fp32_modules) - available_modules:
+        raise ValueError(f'FP32 modules not found in this model: {sorted(missing)}')
+    excluded_nodes = [] if quantize_detect_head else list(detect_nodes)
+    excluded_nodes += [
+        node.name for node in graph.node if node.op_type == 'Conv'
+        and (match := MODEL_NODE_PATTERN.match(node.name))
+        and int(match.group(1)) in fp32_modules
+        and node.name not in excluded_nodes
+    ]
     activation_qtype = QuantType.QUInt8 if activation_type == "u8" else QuantType.QInt8
 
     head_strategy = (
-        f"keeping model.{detect_index} Detect head ({len(excluded_nodes)} Conv nodes) in FP32"
-        if excluded_nodes
+        f"keeping model.{detect_index} Detect head and modules {fp32_modules} in FP32"
+        if not quantize_detect_head
         else f"quantizing model.{detect_index} Detect head (unsafe for YOLO26)"
     )
     print(f"Quantizing {conv_count - len(excluded_nodes)}/{conv_count} Conv nodes -> {int8_path}; {head_strategy}")
@@ -309,9 +355,19 @@ def quantize_conv_only(
         activation_type=activation_qtype,
         weight_type=QuantType.QInt8,
         calibrate_method=CalibrationMethod.MinMax,
-        calibration_providers=["CPUExecutionProvider"],
+        calibration_providers=calibration_providers or ["CPUExecutionProvider"],
     )
-    add_quantization_metadata(int8_path, excluded_nodes, activation_type)
+    add_quantization_metadata(int8_path, [] if quantize_detect_head else detect_nodes, activation_type)
+    model = onnx.load(str(int8_path))
+    for key, value in {
+        'quantization.fp32_modules': json.dumps(fp32_modules),
+        'quantization.quantized_conv_count': str(conv_count - len(excluded_nodes)),
+        'quantization.calibration_method': 'MinMax',
+        'quantization.calibration_images': str(len(calibration_images)),
+    }.items():
+        item = model.metadata_props.add()
+        item.key, item.value = key, value
+    onnx.save(model, str(int8_path))
 
 
 def extract_scores(output: np.ndarray) -> np.ndarray:
@@ -325,8 +381,14 @@ def extract_scores(output: np.ndarray) -> np.ndarray:
     raise RuntimeError(f"Could not identify confidence scores in output shape {output.shape}")
 
 
+def inference_session(path: Path, providers: list[str] | None = None) -> ort.InferenceSession:
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = 4
+    return ort.InferenceSession(str(path), sess_options=options, providers=providers or ['CPUExecutionProvider'])
+
+
 def smoke_test(onnx_path: Path, image_path: Path, imgsz: int) -> tuple[float, int, tuple[int, ...]]:
-    session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+    session = inference_session(onnx_path)
     input_name = session.get_inputs()[0].name
     image = preprocess_image(image_path, imgsz)
     if image is None:
@@ -359,10 +421,11 @@ def verify_end2end_quality(
     imgsz: int,
     conf: float,
     min_match_recall: float,
+    providers: list[str] | None = None,
 ) -> None:
     """Reject YOLO26 INT8 models whose final detections diverge sharply from FP32."""
     sessions = [
-        ort.InferenceSession(str(path), providers=["CPUExecutionProvider"]) for path in (fp32_path, int8_path)
+        inference_session(path, providers) for path in (fp32_path, int8_path)
     ]
     input_names = [session.get_inputs()[0].name for session in sessions]
     fp32_count = 0
@@ -426,13 +489,67 @@ def verify_end2end_quality(
         raise RuntimeError("INT8 quality gate failed: " + "; ".join(failures))
 
 
+def check_map_drop(reference: dict, candidate: dict, max_drop: float, max_class_drop: float) -> dict:
+    """Use labeled accuracy, not agreement alone, to decide whether to publish."""
+    if not reference['classes']:
+        raise RuntimeError('No labeled classes found for accuracy validation')
+    for result in (reference, candidate):
+        values = [result['map50_95']]
+        values.extend(value for metrics in result['classes'].values() for value in metrics.values())
+        if not all(np.isfinite(value) for value in values):
+            raise RuntimeError('Non-finite mAP in accuracy validation')
+    drops = {'overall': reference['map50_95'] - candidate['map50_95'], 'classes': {}}
+    failures = []
+    if drops['overall'] > max_drop:
+        failures.append(f"overall mAP50-95 drop {drops['overall']:.5f} > {max_drop:.5f}")
+    for name, metrics in reference['classes'].items():
+        other = candidate['classes'].get(name, {'map50': 0.0, 'map50_95': 0.0})
+        delta = {key: metrics[key] - other[key] for key in ('map50', 'map50_95')}
+        drops['classes'][name] = delta
+        for key, value in delta.items():
+            if value > max_class_drop:
+                failures.append(f"{name} {key} drop {value:.5f} > {max_class_drop:.5f}")
+    if failures:
+        raise RuntimeError('Labeled INT8 accuracy gate failed: ' + '; '.join(failures))
+    return drops
+
+
+def validate_map(path: Path, data_yaml: Path, split: str, imgsz: int, device: str, project: Path) -> dict:
+    model = YOLO(str(path), task='detect')
+    metrics = model.val(
+        data=str(data_yaml.resolve()), split=split, imgsz=imgsz, rect=False,
+        batch=1, half=False, device=device, workers=4, plots=False,
+        conf=0.001, iou=0.7, max_det=300,
+        project=str(project), name=path.stem, exist_ok=True,
+    )
+    return {
+        'map50': float(metrics.box.map50), 'map50_95': float(metrics.box.map),
+        'classes': {
+            metrics.names[int(cls)]: {
+                'map50': float(metrics.box.ap50[index]),
+                'map50_95': float(metrics.box.ap[index]),
+            }
+            for index, cls in enumerate(metrics.box.ap_class_index)
+        },
+    }
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open('rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Export a mixed-precision YOLO ONNX model with an FP32 Detect head and INT8 backbone/neck."
+        description="Export INT8 ONNX with FP32 sensitive layers and labeled accuracy validation."
     )
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Input .pt model.")
     parser.add_argument("--data", default=DEFAULT_DATA, help="Ultralytics data yaml used for calibration images.")
-    parser.add_argument("--split", default="val", help="Dataset split used for calibration.")
+    parser.add_argument("--split", default="train", help="Dataset split used for calibration; use training data.")
+    parser.add_argument("--verify-split", default="val", help="Independent split for quality checks.")
     parser.add_argument(
         "--imgsz",
         type=int,
@@ -440,7 +557,7 @@ def parse_args() -> argparse.Namespace:
         help="Export/calibration image size. Defaults to the training size stored in a .pt checkpoint.",
     )
     parser.add_argument("--calib-images", type=int, default=DEFAULT_CALIBRATION_IMAGES)
-    parser.add_argument("--seed", type=int, default=20260707)
+    parser.add_argument("--seed", type=int, default=20261024)
     parser.add_argument("--output", default=None, help="Output INT8 ONNX path.")
     parser.add_argument("--quant-format", choices=("qdq", "qoperator"), default="qdq")
     parser.add_argument(
@@ -457,6 +574,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--verify-images", type=int, default=DEFAULT_VERIFY_IMAGES)
     parser.add_argument("--verify-conf", type=float, default=DEFAULT_VERIFY_CONF)
     parser.add_argument("--min-match-recall", type=float, default=DEFAULT_MIN_MATCH_RECALL)
+    parser.add_argument('--fp32-modules', type=int, nargs='*', default=list(DEFAULT_FP32_MODULES),
+                        help='Early sensitive module indices kept in FP32, in addition to the Detect head.')
+    parser.add_argument('--device', default='auto', help='Accuracy validation device: auto, cpu, or GPU index.')
+    parser.add_argument('--max-map-drop', type=float, default=0.003,
+                        help='Maximum absolute overall mAP50-95 loss versus FP32 (0.003 = 0.3 percentage points).')
+    parser.add_argument('--max-class-map-drop', type=float, default=0.005,
+                        help='Maximum per-class mAP50 and mAP50-95 loss (0.005 = 0.5 percentage points).')
+    parser.add_argument('--skip-map-check', action='store_true',
+                        help='Skip full labeled validation; report marks the export as accuracy-unverified.')
     parser.add_argument("--force-fp32-export", action="store_true", help="Re-export the FP32 ONNX even if it exists.")
     parser.add_argument("--no-simplify", action="store_true", help="Disable FP32 ONNX simplification.")
     return parser.parse_args()
@@ -472,6 +598,10 @@ def main() -> None:
         raise ValueError("--verify-conf must be between 0 and 1")
     if not 0.0 <= args.min_match_recall <= 1.0:
         raise ValueError("--min-match-recall must be between 0 and 1")
+    if not 0 <= args.max_map_drop <= 1 or not 0 <= args.max_class_map_drop <= 1:
+        raise ValueError('mAP drop limits must be between 0 and 1')
+    if args.split == args.verify_split:
+        raise ValueError('Calibration and verification splits must differ; use --split train --verify-split val')
     model_path = Path(args.model)
     data_yaml = Path(args.data)
     imgsz = resolve_export_imgsz(model_path, args.imgsz)
@@ -482,6 +612,9 @@ def main() -> None:
         force=args.force_fp32_export,
     )
     int8_path = Path(args.output) if args.output else fp32_path.with_name(f"{fp32_path.stem}_int8.onnx")
+    if int8_path.resolve() in {model_path.resolve(), fp32_path.resolve()}:
+        raise ValueError('INT8 output must differ from the source checkpoint and FP32 ONNX')
+    int8_path.parent.mkdir(parents=True, exist_ok=True)
 
     calibration_images = choose_calibration_images(
         data_yaml=data_yaml,
@@ -491,13 +624,32 @@ def main() -> None:
     )
     verification_images = choose_verification_images(
         data_yaml=data_yaml,
-        split=args.split,
+        split=args.verify_split,
         calibration_images=calibration_images,
         count=args.verify_images,
         seed=args.seed,
     )
     print(f"Using {len(calibration_images)} calibration images from {data_yaml} split={args.split!r}")
     print(f"Using {len(verification_images)} independent images for the INT8 quality gate")
+    validation_paths = resolve_split_paths(data_yaml, args.verify_split)
+    if set(calibration_images).intersection(validation_paths):
+        raise ValueError('Calibration and validation contain overlapping image paths')
+    device = ('0' if torch.cuda.is_available() else 'cpu') if args.device == 'auto' else args.device
+    providers = ['CPUExecutionProvider']
+    if device != 'cpu' and torch.cuda.is_available() and 'CUDAExecutionProvider' in ort.get_available_providers():
+        providers.insert(0, 'CUDAExecutionProvider')
+    report = {
+        'checkpoint': str(model_path.resolve()), 'checkpoint_sha256': sha256(model_path),
+        'fp32_sha256': sha256(fp32_path), 'imgsz': imgsz, 'rect': False,
+        'batch': 1, 'half': False, 'calibration_split': args.split,
+        'calibration_images': [str(p) for p in calibration_images],
+        'validation_split': args.verify_split, 'validation_images': len(validation_paths),
+        'validation_manifest_sha256': hashlib.sha256('\n'.join(map(str, validation_paths)).encode()).hexdigest(),
+        'fp32_modules': args.fp32_modules, 'activation_type': args.activation_type,
+        'calibration_method': 'MinMax', 'per_channel': True,
+        'accuracy_verified': False, 'device': device,
+        'max_map_drop': args.max_map_drop, 'max_class_map_drop': args.max_class_map_drop,
+    }
 
     candidate_path = int8_path.with_name(f".{int8_path.stem}.candidate{int8_path.suffix}")
     candidate_path.unlink(missing_ok=True)
@@ -510,6 +662,8 @@ def main() -> None:
             quant_format=args.quant_format,
             activation_type=args.activation_type,
             quantize_detect_head=args.quantize_detect_head,
+            fp32_modules=tuple(args.fp32_modules),
+            calibration_providers=providers,
         )
 
         score_max, nonzero_scores, output_shape = smoke_test(candidate_path, verification_images[0], imgsz)
@@ -523,11 +677,24 @@ def main() -> None:
             imgsz=imgsz,
             conf=args.verify_conf,
             min_match_recall=args.min_match_recall,
+            providers=providers,
         )
+        if not args.skip_map_check:
+            with tempfile.TemporaryDirectory(prefix='int8_validation_') as workdir:
+                project = Path(workdir)
+                reference = validate_map(fp32_path, data_yaml, args.verify_split, imgsz, device, project)
+                candidate = validate_map(candidate_path, data_yaml, args.verify_split, imgsz, device, project)
+            report.update(fp32_metrics=reference, int8_metrics=candidate)
+            report['map_drop'] = check_map_drop(reference, candidate, args.max_map_drop, args.max_class_map_drop)
+            report['accuracy_verified'] = True
+        report['int8_sha256'] = sha256(candidate_path)
         candidate_path.replace(int8_path)
-    except Exception:
+    except Exception as error:
+        report['error'] = str(error)
+        int8_path.with_suffix('.rejected.accuracy.json').write_text(json.dumps(report, indent=2))
         candidate_path.unlink(missing_ok=True)
         raise
+    int8_path.with_suffix('.accuracy.json').write_text(json.dumps(report, indent=2))
 
     fp32_size = fp32_path.stat().st_size / 1024 / 1024
     int8_size = int8_path.stat().st_size / 1024 / 1024
