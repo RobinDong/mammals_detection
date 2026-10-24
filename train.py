@@ -1,5 +1,9 @@
+import argparse
+import json
 import math
 import os
+import shutil
+import sys
 from pathlib import Path
 
 try:
@@ -10,11 +14,15 @@ import cv2
 import numpy as np
 import torch
 from torch.utils.data import WeightedRandomSampler
-from ultralytics import YOLO
+from ultralytics import YOLO, __version__ as ULTRALYTICS_VERSION
+from ultralytics.cfg import DEFAULT_CFG_DICT
 from ultralytics.data.build import InfiniteDataLoader, seed_worker
 from ultralytics.models.yolo.detect.train import DetectionTrainer
 from ultralytics.utils import LOGGER
 from ultralytics.utils.torch_utils import torch_distributed_zero_first
+
+from training_augmentations import ScreenCaptureAugmentation
+from texture_validation import TextureValidationProbe
 
 
 RARE_CLASS_ID = 7  # others
@@ -23,6 +31,21 @@ RARE_IMAGE_FRACTION = 0.002
 HARD_NEGATIVE_IMAGE_FRACTION = 0.08
 SEAHORSE_IMAGE_FRACTION = 0.01
 SEAHORSE_TRAIN_ROOT = "/data/seahorse/images/train/"
+SCREEN_AUGMENTATION_P = 0.35
+TRAIN_IMAGE_SIZE = 896
+TRAIN_MULTI_SCALE = 1 / 7  # Stride-aligned batch sizes from 768 through 1024.
+
+
+def check_training_runtime():
+    """Reject an incompatible interpreter before loading weights or making a run."""
+    if "cls_pw" not in DEFAULT_CFG_DICT:
+        raise RuntimeError(
+            f"Incompatible training environment: Ultralytics {ULTRALYTICS_VERSION} "
+            f"does not support cls_pw. Python: {sys.executable}\n"
+            "Activate the project environment with `conda activate yolo`, then "
+            "run the same python3 train.py command again. Do not remove cls_pw "
+            "to bypass this check: it controls the intended class weighting."
+        )
 
 
 def class_group_sample_weights(
@@ -70,6 +93,21 @@ def class_group_sample_weights(
 
 class ScratchTrainer(DetectionTrainer):
     """Train all parameters from scratch with mild class-aware sampling."""
+
+    def build_dataset(self, img_path, mode="train", batch=None):
+        dataset = super().build_dataset(img_path, mode, batch)
+        if mode == "train":
+            augmentation = ScreenCaptureAugmentation(p=SCREEN_AUGMENTATION_P)
+            dataset.transforms.insert(-1, augmentation)  # Before image-to-tensor Format.
+            LOGGER.info("Training image augmentation: %s", augmentation)
+        return dataset
+
+    def _close_dataloader_mosaic(self):
+        super()._close_dataloader_mosaic()
+        # close_mosaic rebuilds the pipeline, so restore this image-only stage.
+        self.train_loader.dataset.transforms.insert(
+            -1, ScreenCaptureAugmentation(p=SCREEN_AUGMENTATION_P)
+        )
 
     def check_resume(self, overrides):
         super().check_resume(overrides)
@@ -144,11 +182,39 @@ class ScratchTrainer(DetectionTrainer):
     def validate(self):
         metrics, fitness = super().validate()
         class_maps = self.validator.metrics.box.maps
+        for class_id, name in self.data["names"].items():
+            if class_id < len(class_maps):
+                metrics[f"metrics/mAP50-95({name})"] = float(class_maps[class_id])
         if len(class_maps) > RARE_CLASS_ID:
             rare_map = float(class_maps[RARE_CLASS_ID])
             metrics["metrics/mAP50-95(others)"] = rare_map
             LOGGER.info("others mAP50-95: %.5f", rare_map)
+        if not hasattr(self, "texture_probe"):
+            self.texture_probe = TextureValidationProbe(
+                self.test_loader.dataset.labels, self.data["names"], self.save_dir
+            )
+        probe_metrics = self.texture_probe(self.ema.ema, self.device, self.epoch + 1)
+        metrics.update(probe_metrics)
+        LOGGER.info("Texture probe (localized top-class recall, not mAP): %s", probe_metrics)
         return metrics, fitness
+
+    def save_model(self):
+        saved = super().save_model()
+        if saved is False:
+            return False
+        # Keep standard best.pt selection intact. This second checkpoint uses a
+        # fixed validation subset at BOTH deployment sizes, clean and corrupted.
+        score = self.metrics.get("probe/score")
+        metadata = self.wdir / "best_texture.json"
+        if not hasattr(self, "_best_texture_score"):
+            self._best_texture_score = json.loads(metadata.read_text())["score"] if metadata.exists() else -1.0
+        if score is not None and score > self._best_texture_score:
+            temporary = self.wdir / "best_texture.pt.tmp"
+            shutil.copyfile(self.last, temporary)
+            temporary.replace(self.wdir / "best_texture.pt")
+            metadata.write_text(json.dumps({"score": score, "epoch": self.epoch + 1}))
+            self._best_texture_score = score
+        return saved
 
 
 # Target the failure mode in bad2.jpg: a large waterbird near the lower image
@@ -217,20 +283,28 @@ targeted_augmentations = [
 ] if A is not None else []
 
 
-def main():
-    # Loading the architecture YAML (not yolo26l.pt) creates random weights.
-    model = YOLO("yolo26l.yaml")
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Train with screen-texture augmentation and validation")
+    parser.add_argument("--weights", type=Path, help="Fine-tune these .pt weights with a fresh optimizer")
+    parser.add_argument("--epochs", type=int, default=None)
+    args = parser.parse_args(argv)
+    check_training_runtime()
+    if args.weights is not None and not args.weights.is_file():
+        raise FileNotFoundError(args.weights)
+    finetune = args.weights is not None
+    # An explicit checkpoint avoids spending another run learning from scratch.
+    model = YOLO(str(args.weights) if finetune else "yolo26l.yaml")
     return model.train(
         trainer=ScratchTrainer,
         data=str(Path(__file__).resolve().with_name("robin_extra_seahorse.yaml")),
-        name="yolo26l_scratch_768",
-        epochs=200,
+        name="yolo26l_finetune_texture_v2" if finetune else "yolo26l_scratch_texture_v2",
+        epochs=args.epochs if args.epochs is not None else (30 if finetune else 200),
         patience=40,
         batch=8,
-        imgsz=768,
+        imgsz=TRAIN_IMAGE_SIZE,
         save_period=5,
         resume=False,
-        pretrained=False,
+        pretrained=finetune,
         device=0,
         cache=False,
         workers=8,
@@ -242,13 +316,13 @@ def main():
         # diversity without imposing a waterbird-only prior.
         # augmentations=targeted_augmentations,
 
-        optimizer="MuSGD",
-        lr0=0.01,
-        lrf=0.01,
-        momentum=0.937,
+        optimizer="AdamW" if finetune else "MuSGD",
+        lr0=0.0001 if finetune else 0.01,
+        lrf=0.1 if finetune else 0.01,
+        momentum=0.9 if finetune else 0.937,
         weight_decay=0.0005,
-        warmup_epochs=3.0,
-        warmup_bias_lr=0.1,
+        warmup_epochs=1.0 if finetune else 3.0,
+        warmup_bias_lr=0.0 if finetune else 0.1,
         cos_lr=True,
 
         # Mild inverse-frequency weighting complements the conservative sampler.
@@ -269,7 +343,7 @@ def main():
         close_mosaic=10,
         mixup=0.05,
         cutmix=0.0,
-        multi_scale=0.0,
+        multi_scale=TRAIN_MULTI_SCALE,
     )
 
 

@@ -1,0 +1,22 @@
+# Original eight-class dataset plus the reviewed seahorse supplement.
+# Seahorses retain class 5 (fish). New split ratio: train/test/valid = 80/10/10.
+path: /data
+train:
+  - /data/coco_extra/train2017.txt
+  - /data/seahorse/train.txt
+val:
+  - /data/coco_extra/val2017.txt
+  - /data/seahorse/valid.txt
+test:
+  - /data/coco_extra/test-dev2017.txt
+  - /data/seahorse/test.txt
+nc: 8
+names:
+  0: person
+  1: bird
+  2: mammals
+  3: reptile
+  4: amphibia
+  5: fish
+  6: shrimp
+  7: others
