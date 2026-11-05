@@ -31,6 +31,10 @@ RARE_IMAGE_FRACTION = 0.002
 HARD_NEGATIVE_IMAGE_FRACTION = 0.08
 SEAHORSE_IMAGE_FRACTION = 0.01
 SEAHORSE_TRAIN_ROOT = "/data/seahorse/images/train/"
+# 80 reviewed training photos get about 6.8 draws/photo per full-data epoch,
+# comparable to the seahorse supplement. Validation/test are never oversampled.
+HARD_BIRD_IMAGE_FRACTION = 0.002
+HARD_BIRD_TRAIN_ROOT = "/data/hard_bird_detection/images/train/"
 SCREEN_AUGMENTATION_P = 0.35
 TRAIN_IMAGE_SIZE = 896
 TRAIN_MULTI_SCALE = 1 / 7  # Stride-aligned batch sizes from 768 through 1024.
@@ -56,11 +60,17 @@ def class_group_sample_weights(
     rare_fraction,
     hard_negative_fraction,
     seahorse_fraction,
+    hard_bird_fraction=0.0,
 ):
-    """Assign probability mass to rare, shrimp, seahorse, and other images."""
-    common_fraction = 1.0 - rare_fraction - hard_negative_fraction - seahorse_fraction
-    if min(rare_fraction, hard_negative_fraction, seahorse_fraction, common_fraction) <= 0.0:
-        raise ValueError("All sampling fractions must be positive")
+    """Group order: rare, shrimp, seahorse, optional hard bird, then common.
+
+    A zero hard_bird_fraction preserves the four-group API used by experiments.
+    """
+    common_fraction = 1.0 - rare_fraction - hard_negative_fraction - seahorse_fraction - hard_bird_fraction
+    fractions = (rare_fraction, hard_negative_fraction, seahorse_fraction, common_fraction)
+    if (not all(np.isfinite(f) for f in (*fractions, hard_bird_fraction))
+            or min(fractions) <= 0.0 or hard_bird_fraction < 0.0):
+        raise ValueError("Sampling fractions must be finite and positive; hard bird may be zero")
 
     classes = [np.asarray(label["cls"], dtype=np.int64).reshape(-1) for label in labels]
     if len(classes) != len(image_files):
@@ -74,8 +84,19 @@ def class_group_sample_weights(
         [os.path.abspath(path).startswith(SEAHORSE_TRAIN_ROOT) for path in image_files],
         dtype=bool,
     ) & ~(rare_mask | hard_negative_mask)
-    common_mask = ~(rare_mask | hard_negative_mask | seahorse_mask)
-    group_masks = (rare_mask, hard_negative_mask, seahorse_mask, common_mask)
+    assigned_mask = rare_mask | hard_negative_mask | seahorse_mask
+    group_masks = [rare_mask, hard_negative_mask, seahorse_mask]
+    group_fractions = [rare_fraction, hard_negative_fraction, seahorse_fraction]
+    if hard_bird_fraction > 0.0:
+        hard_bird_mask = np.asarray(
+            [os.path.abspath(path).startswith(HARD_BIRD_TRAIN_ROOT) for path in image_files],
+            dtype=bool,
+        ) & ~assigned_mask
+        group_masks.append(hard_bird_mask)
+        group_fractions.append(hard_bird_fraction)
+        assigned_mask |= hard_bird_mask
+    group_masks.append(~assigned_mask)
+    group_fractions.append(common_fraction)
     group_counts = tuple(int(mask.sum()) for mask in group_masks)
     if any(count == 0 for count in group_counts):
         raise RuntimeError(f"Empty sampling group: counts={group_counts}")
@@ -84,7 +105,7 @@ def class_group_sample_weights(
     for mask, count, fraction in zip(
         group_masks,
         group_counts,
-        (rare_fraction, hard_negative_fraction, seahorse_fraction, common_fraction),
+        group_fractions,
         strict=True,
     ):
         weights[mask] = fraction / count
@@ -133,6 +154,7 @@ class ScratchTrainer(DetectionTrainer):
             rare_fraction=RARE_IMAGE_FRACTION,
             hard_negative_fraction=HARD_NEGATIVE_IMAGE_FRACTION,
             seahorse_fraction=SEAHORSE_IMAGE_FRACTION,
+            hard_bird_fraction=HARD_BIRD_IMAGE_FRACTION,
         )
         samples = len(dataset)
         sampler_generator = torch.Generator().manual_seed(int(self.args.seed))
@@ -151,8 +173,8 @@ class ScratchTrainer(DetectionTrainer):
         loader_generator = torch.Generator().manual_seed(6148914691236517205)
         LOGGER.info(
             "Class-group sampling: others=%d (%.2f%%), shrimp hard negatives=%d (%.1f%%), "
-            "seahorse=%d (%.1f%%), other=%d (%.1f%%), samples/epoch=%d; "
-            "expected others/shrimp/seahorse=%d/%d/%d",
+            "seahorse=%d (%.1f%%), hard bird=%d (%.2f%%), other=%d (%.1f%%), samples/epoch=%d; "
+            "expected others/shrimp/seahorse/hard_bird=%d/%d/%d/%d",
             group_counts[0],
             100 * RARE_IMAGE_FRACTION,
             group_counts[1],
@@ -160,11 +182,14 @@ class ScratchTrainer(DetectionTrainer):
             group_counts[2],
             100 * SEAHORSE_IMAGE_FRACTION,
             group_counts[3],
-            100 * (1.0 - RARE_IMAGE_FRACTION - HARD_NEGATIVE_IMAGE_FRACTION - SEAHORSE_IMAGE_FRACTION),
+            100 * HARD_BIRD_IMAGE_FRACTION,
+            group_counts[4],
+            100 * (1.0 - RARE_IMAGE_FRACTION - HARD_NEGATIVE_IMAGE_FRACTION - SEAHORSE_IMAGE_FRACTION - HARD_BIRD_IMAGE_FRACTION),
             samples,
             round(samples * RARE_IMAGE_FRACTION),
             round(samples * HARD_NEGATIVE_IMAGE_FRACTION),
             round(samples * SEAHORSE_IMAGE_FRACTION),
+            round(samples * HARD_BIRD_IMAGE_FRACTION),
         )
         return InfiniteDataLoader(
             dataset=dataset,
@@ -298,8 +323,8 @@ def main(argv=None):
         trainer=ScratchTrainer,
         data=str(Path(__file__).resolve().with_name("robin_extra_seahorse.yaml")),
         name="yolo26l_finetune_texture_v2" if finetune else "yolo26l_scratch_texture_v2",
-        epochs=args.epochs if args.epochs is not None else (30 if finetune else 200),
-        patience=40,
+        epochs=args.epochs if args.epochs is not None else (15 if finetune else 200),
+        patience=10,
         batch=8,
         imgsz=TRAIN_IMAGE_SIZE,
         save_period=5,

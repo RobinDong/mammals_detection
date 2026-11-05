@@ -8,6 +8,7 @@ import os
 import random
 import re
 import tempfile
+from collections import Counter
 from pathlib import Path
 
 # onnxruntime-gpu already provides the onnxruntime module.  Prevent Ultralytics'
@@ -31,15 +32,20 @@ from ultralytics import YOLO, __version__ as ULTRALYTICS_VERSION
 from ultralytics.data.augment import LetterBox
 
 
-DEFAULT_MODEL = "runs/detect/yolo26l_finetune_texture_v2-2/weights/best.pt"
+DEFAULT_MODEL = "runs/detect/yolo26l_finetune_texture_v2-11/weights/best.pt"
 DEFAULT_DATA = "robin_extra_seahorse.yaml"
 DEFAULT_IMGSZ = None
 DEFAULT_CALIBRATION_IMAGES = 512
 DEFAULT_VERIFY_IMAGES = 100
 DEFAULT_VERIFY_CONF = 0.05
 DEFAULT_MIN_MATCH_RECALL = 0.90
+COMPACT_MAX_BYTES = 30_000_000
+COMPACT_WEIGHT_GROUP_SIZE = 32
+VALIDATION_SETTINGS = dict(rect=False, batch=1, half=False, conf=0.001, iou=0.7, max_det=300)
 MODEL_NODE_PATTERN = re.compile(r"^/model\.(\d+)(?:/|$)")
-DEFAULT_FP32_MODULES = (0, 1, 2, 3, 4)
+# Keep the early backbone and YOLO26l neck in FP32. Quantize backbone modules 7–10.
+DEFAULT_FP32_MODULES = (0, 1, 2, 3, 4, 5, 6, 13, 16, 17, 19, 20, 22)
+INTEGER_FP32_MODULES = (0, 1, 2, 3, 4, 13, 16, 17, 19, 20, 22)
 
 
 def resolve_split_paths(data_yaml: Path, split: str) -> list[Path]:
@@ -253,12 +259,15 @@ def export_fp32_onnx(model_path: Path, imgsz: int, simplify: bool, force: bool) 
         print(f"Re-exporting stale/incompatible FP32 ONNX: {fp32_path} ({'; '.join(reasons)})")
 
     print(f"Exporting FP32 ONNX from {model_path}")
-    exported = export_model.export(
-        format="onnx",
-        imgsz=imgsz,
-        simplify=simplify,
-        dynamic=False,
-    )
+    # Ultralytics hides CUDA when exporting on CPU. Restore visibility for calibration and validation.
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    try:
+        exported = export_model.export(format="onnx", imgsz=imgsz, simplify=simplify, dynamic=False)
+    finally:
+        if visible_devices is None:
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = visible_devices
     return Path(exported)
 
 
@@ -368,6 +377,73 @@ def quantize_conv_only(
         item = model.metadata_props.add()
         item.key, item.value = key, value
     onnx.save(model, str(int8_path))
+
+
+def quantize_compact_weights(fp32_path: Path, int8_path: Path, *, fold_on_load: bool = False) -> int:
+    """Store Conv weights as grouped INT8, with FP32 dequantization before Conv."""
+    model = onnx.load(str(fp32_path))
+    graph = model.graph
+    input_names = {value.name for value in graph.input}
+    weight_names = {node.input[1] for node in graph.node if node.op_type == 'Conv'} - input_names
+    initializers = [tensor for tensor in graph.initializer if tensor.name in weight_names
+                    and tensor.data_type == onnx.TensorProto.FLOAT]
+    if not initializers and not fold_on_load:
+        raise RuntimeError('No FP32 Conv weights found for compact quantization')
+
+    tensor_names = {tensor.name for tensor in graph.initializer} | input_names
+    tensor_names.update(name for node in graph.node for name in node.output)
+    dequant_nodes = []
+    for index, tensor in enumerate(initializers):
+        weight = onnx.numpy_helper.to_array(tensor)
+        channels = weight.reshape(weight.shape[0], -1)
+        groups = channels
+        if channels.shape[1] % COMPACT_WEIGHT_GROUP_SIZE == 0:
+            groups = channels.reshape(-1, COMPACT_WEIGHT_GROUP_SIZE)
+        max_abs = np.max(np.abs(groups), axis=1)
+        scale = np.where(max_abs == 0, np.float32(1), max_abs / np.float32(127))
+        quantized = np.clip(np.rint(groups / scale[:, None]), -127, 127).astype(np.int8)
+
+        prefix = f'compact_weight_{index}'
+        while any(f'{prefix}_{suffix}' in tensor_names for suffix in ('int8', 'scale', 'flat', 'shape', 'float')):
+            prefix += '_'
+        quant_name, scale_name, flat_name, shape_name = (
+            f'{prefix}_{suffix}' for suffix in ('int8', 'scale', 'flat', 'shape')
+        )
+        graph.initializer.extend([
+            onnx.numpy_helper.from_array(quantized, quant_name),
+            onnx.numpy_helper.from_array(scale[:, None] if fold_on_load else scale, scale_name),
+            onnx.numpy_helper.from_array(np.asarray(weight.shape, dtype=np.int64), shape_name),
+        ])
+        if fold_on_load:
+            # Constant Cast/Mul can fold while activation Q/DQ remains available for integer kernels.
+            float_name = f'{prefix}_float'
+            dequant_nodes.extend([
+                onnx.helper.make_node('Cast', [quant_name], [float_name], to=onnx.TensorProto.FLOAT),
+                onnx.helper.make_node('Mul', [float_name, scale_name], [flat_name]),
+            ])
+        else:
+            dequant_nodes.append(onnx.helper.make_node('DequantizeLinear', [quant_name, scale_name], [flat_name], axis=0))
+        dequant_nodes.append(onnx.helper.make_node('Reshape', [flat_name, shape_name], [tensor.name]))
+
+    quantized_names = {tensor.name for tensor in initializers}
+    for index in reversed(range(len(graph.initializer))):
+        if graph.initializer[index].name in quantized_names:
+            del graph.initializer[index]
+    dequant_nodes.extend(graph.node)
+    del graph.node[:]
+    graph.node.extend(dequant_nodes)
+    metadata = {item.key: item.value for item in model.metadata_props}
+    metadata.update({
+        'quantization.strategy': 'compact-integer-conv' if fold_on_load else 'compact-weight-only',
+        'quantization.weight_type': 's8',
+        'quantization.weight_group_size': str(COMPACT_WEIGHT_GROUP_SIZE),
+        'quantization.activation_type': metadata.get('quantization.activation_type', 'fp32') if fold_on_load else 'fp32',
+        'quantization.quantized_weight_count': str(len(initializers)),
+    })
+    onnx.helper.set_model_props(model, metadata)
+    onnx.checker.check_model(model)
+    onnx.save(model, str(int8_path))
+    return len(initializers)
 
 
 def extract_scores(output: np.ndarray) -> np.ndarray:
@@ -489,10 +565,16 @@ def verify_end2end_quality(
         raise RuntimeError("INT8 quality gate failed: " + "; ".join(failures))
 
 
-def check_map_drop(reference: dict, candidate: dict, max_drop: float, max_class_drop: float) -> dict:
-    """Use labeled accuracy, not agreement alone, to decide whether to publish."""
+def check_map_drop(
+    reference: dict, candidate: dict, max_drop: float, max_class_drop: float, *, loss_only: bool = False,
+) -> dict:
+    """Check mAP50-95, with optional symmetric parity and AP50 limits."""
     if not reference['classes']:
         raise RuntimeError('No labeled classes found for accuracy validation')
+    if reference['classes'].keys() != candidate['classes'].keys():
+        missing = sorted(reference['classes'].keys() - candidate['classes'].keys())
+        extra = sorted(candidate['classes'].keys() - reference['classes'].keys())
+        raise RuntimeError(f'Validation class mismatch (missing={missing}, extra={extra})')
     for result in (reference, candidate):
         values = [result['map50_95']]
         values.extend(value for metrics in result['classes'].values() for value in metrics.values())
@@ -500,15 +582,19 @@ def check_map_drop(reference: dict, candidate: dict, max_drop: float, max_class_
             raise RuntimeError('Non-finite mAP in accuracy validation')
     drops = {'overall': reference['map50_95'] - candidate['map50_95'], 'classes': {}}
     failures = []
-    if drops['overall'] > max_drop:
-        failures.append(f"overall mAP50-95 drop {drops['overall']:.5f} > {max_drop:.5f}")
+    gap_name = 'loss' if loss_only else 'difference'
+    overall_gap = drops['overall'] if loss_only else abs(drops['overall'])
+    if overall_gap > max_drop:
+        failures.append(f"overall mAP50-95 {gap_name} {overall_gap:.5f} > {max_drop:.5f}")
     for name, metrics in reference['classes'].items():
-        other = candidate['classes'].get(name, {'map50': 0.0, 'map50_95': 0.0})
+        other = candidate['classes'][name]
         delta = {key: metrics[key] - other[key] for key in ('map50', 'map50_95')}
         drops['classes'][name] = delta
-        for key, value in delta.items():
-            if value > max_class_drop:
-                failures.append(f"{name} {key} drop {value:.5f} > {max_class_drop:.5f}")
+        class_gap = delta['map50_95'] if loss_only else abs(delta['map50_95'])
+        if class_gap > max_class_drop:
+            failures.append(f"{name} mAP50-95 {gap_name} {class_gap:.5f} > {max_class_drop:.5f}")
+        if not loss_only and delta['map50'] > max_class_drop:
+            failures.append(f"{name} AP50 drop {delta['map50']:.5f} > {max_class_drop:.5f}")
     if failures:
         raise RuntimeError('Labeled INT8 accuracy gate failed: ' + '; '.join(failures))
     return drops
@@ -517,9 +603,8 @@ def check_map_drop(reference: dict, candidate: dict, max_drop: float, max_class_
 def validate_map(path: Path, data_yaml: Path, split: str, imgsz: int, device: str, project: Path) -> dict:
     model = YOLO(str(path), task='detect')
     metrics = model.val(
-        data=str(data_yaml.resolve()), split=split, imgsz=imgsz, rect=False,
-        batch=1, half=False, device=device, workers=4, plots=False,
-        conf=0.001, iou=0.7, max_det=300,
+        data=str(data_yaml.resolve()), split=split, imgsz=imgsz,
+        device=device, workers=4, plots=False, **VALIDATION_SETTINGS,
         project=str(project), name=path.stem, exist_ok=True,
     )
     return {
@@ -542,13 +627,50 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def profile_integer_convolutions(model: Path, image_path: Path, imgsz: int, providers: list) -> dict:
+    """Check that ONNX Runtime actually runs the model's integer convolution kernels."""
+    graph = onnx.load(str(model), load_external_data=False).graph
+    qlinear_convs = sum(node.op_type == 'QLinearConv' for node in graph.node)
+    if not qlinear_convs:
+        raise RuntimeError('Integer ONNX contains no QLinearConv nodes')
+    image = preprocess_image(image_path, imgsz)
+    if image is None:
+        raise RuntimeError(f'Could not read integer profile image: {image_path}')
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = 4
+    options.enable_profiling = True
+    options.profile_file_prefix = str(model.parent / 'integer_conv_profile')
+    session = ort.InferenceSession(str(model), sess_options=options, providers=providers)
+    session.run(None, {session.get_inputs()[0].name: image})
+    events = json.loads(Path(session.end_profiling()).read_text())
+    counts = Counter(event['args']['provider'] for event in events if
+                     event.get('cat') == 'Node' and event.get('name', '').endswith('_kernel_time') and
+                     event.get('args', {}).get('op_name') == 'QLinearConv')
+    if sum(counts.values()) != qlinear_convs:
+        raise RuntimeError(f"ORT executed {sum(counts.values())}/{qlinear_convs} QLinearConv kernels")
+    print(f"Profile confirmed {qlinear_convs} integer convolution kernel calls: {dict(counts)}")
+    return {'providers': session.get_providers(), 'ort_version': ort.__version__,
+            'qlinear_conv_calls': qlinear_convs, 'qlinear_conv_calls_by_provider': dict(counts),
+            'fp32_convs_in_graph': sum(node.op_type == 'Conv' for node in graph.node)}
+
+
+def load_pt_reference(path: Path, report: dict) -> dict:
+    reference = json.loads(path.read_text())
+    keys = ('checkpoint_sha256', 'data_yaml_sha256', 'imgsz', 'validation_split',
+            'validation_images', 'validation_manifest_sha256', 'accuracy_reference', *VALIDATION_SETTINGS)
+    mismatches = [key for key in keys if reference.get(key) != report[key]]
+    if reference.get('accuracy_verified') is not True or mismatches:
+        raise ValueError(f'PT reference report is unverified or incompatible: {mismatches}')
+    print(f'Using previously validated PT metrics from {path}')
+    return reference['pt_metrics']
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Export INT8 ONNX with FP32 sensitive layers and labeled accuracy validation."
+        description="Export compact INT8-weight ONNX under 30 MB with labeled accuracy validation."
     )
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Input .pt model.")
-    parser.add_argument("--data", default=DEFAULT_DATA, help="Ultralytics data yaml used for calibration images.")
-    parser.add_argument("--split", default="train", help="Dataset split used for calibration; use training data.")
+    parser.add_argument("--data", default=DEFAULT_DATA, help="Ultralytics dataset YAML for validation and calibration.")
     parser.add_argument("--verify-split", default="val", help="Independent split for quality checks.")
     parser.add_argument(
         "--imgsz",
@@ -556,40 +678,69 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_IMGSZ,
         help="Export/calibration image size. Defaults to the training size stored in a .pt checkpoint.",
     )
-    parser.add_argument("--calib-images", type=int, default=DEFAULT_CALIBRATION_IMAGES)
     parser.add_argument("--seed", type=int, default=20261024)
     parser.add_argument("--output", default=None, help="Output INT8 ONNX path.")
-    parser.add_argument("--quant-format", choices=("qdq", "qoperator"), default="qdq")
-    parser.add_argument(
+    calibrated = parser.add_argument_group("Calibrated weight and activation quantization")
+    modes = calibrated.add_mutually_exclusive_group()
+    modes.add_argument("--weight-activation", action="store_true",
+                       help="Use the previous mixed-precision W8A8 export instead of the compact profile.")
+    modes.add_argument('--integer-conv', action='store_true',
+                       help='Export QLinearConv with compact weights and verify actual ORT integer execution.')
+    calibrated.add_argument("--split", help="Calibration split. Defaults to train.")
+    calibrated.add_argument("--calib-images", type=int, help="Calibration sample count. Defaults to 512.")
+    calibrated.add_argument("--quant-format", choices=("qdq", "qoperator"), help="Defaults to qdq.")
+    calibrated.add_argument(
         "--activation-type",
         choices=("u8", "s8"),
-        default="u8",
-        help="INT8 activation type. u8 gave the lowest YOLO26l score error in local validation.",
+        help="Activation quantization type. Defaults to u8.",
     )
-    parser.add_argument(
+    calibrated.add_argument(
         "--quantize-detect-head",
         action="store_true",
         help="Also quantize the Detect head. Not recommended for YOLO26 end-to-end models.",
     )
+    calibrated.add_argument('--fp32-modules', type=int, nargs='*',
+                            help='Sensitive module indices kept in FP32, in addition to the Detect head.')
     parser.add_argument("--verify-images", type=int, default=DEFAULT_VERIFY_IMAGES)
     parser.add_argument("--verify-conf", type=float, default=DEFAULT_VERIFY_CONF)
     parser.add_argument("--min-match-recall", type=float, default=DEFAULT_MIN_MATCH_RECALL)
-    parser.add_argument('--fp32-modules', type=int, nargs='*', default=list(DEFAULT_FP32_MODULES),
-                        help='Early sensitive module indices kept in FP32, in addition to the Detect head.')
     parser.add_argument('--device', default='auto', help='Accuracy validation device: auto, cpu, or GPU index.')
-    parser.add_argument('--max-map-drop', type=float, default=0.003,
-                        help='Maximum absolute overall mAP50-95 loss versus FP32 (0.003 = 0.3 percentage points).')
-    parser.add_argument('--max-class-map-drop', type=float, default=0.005,
-                        help='Maximum per-class mAP50 and mAP50-95 loss (0.005 = 0.5 percentage points).')
+    parser.add_argument('--max-map-drop', type=float,
+                        help='Overall mAP50-95 limit (default 0.003 absolute, or 0.01 loss in integer mode).')
+    parser.add_argument('--max-class-map-drop', type=float,
+                        help='Per-class limit (default 0.005 absolute/AP50 loss, or 0.01 mAP50-95 loss in integer mode).')
+    parser.add_argument('--reference-report', type=Path,
+                        help='Reuse PT metrics from a verified report with matching checkpoint, data and validation settings.')
     parser.add_argument('--skip-map-check', action='store_true',
                         help='Skip full labeled validation; report marks the export as accuracy-unverified.')
     parser.add_argument("--force-fp32-export", action="store_true", help="Re-export the FP32 ONNX even if it exists.")
     parser.add_argument("--no-simplify", action="store_true", help="Disable FP32 ONNX simplification.")
-    return parser.parse_args()
+    args = parser.parse_args()
+    # Existing calibration options continue to select the calibrated export profile.
+    if args.integer_conv and args.quant_format not in {None, 'qoperator'}:
+        parser.error('--integer-conv requires --quant-format qoperator')
+    calibration_defaults = {
+        'split': 'train', 'calib_images': DEFAULT_CALIBRATION_IMAGES,
+        'quant_format': 'qoperator' if args.integer_conv else 'qdq', 'activation_type': 'u8',
+        'fp32_modules': list(INTEGER_FP32_MODULES if args.integer_conv else DEFAULT_FP32_MODULES),
+    }
+    if not args.integer_conv:
+        args.weight_activation |= args.quantize_detect_head or any(
+            getattr(args, name) is not None for name in calibration_defaults
+        )
+    for name, default in calibration_defaults.items():
+        if getattr(args, name) is None:
+            setattr(args, name, default)
+    if args.max_map_drop is None:
+        args.max_map_drop = .01 if args.integer_conv else .003
+    if args.max_class_map_drop is None:
+        args.max_class_map_drop = .01 if args.integer_conv else .005
+    return args
 
 
 def main() -> None:
     args = parse_args()
+    calibrate = args.weight_activation or args.integer_conv
     if args.calib_images < 1:
         raise ValueError("--calib-images must be at least 1")
     if args.verify_images < 1:
@@ -600,10 +751,20 @@ def main() -> None:
         raise ValueError("--min-match-recall must be between 0 and 1")
     if not 0 <= args.max_map_drop <= 1 or not 0 <= args.max_class_map_drop <= 1:
         raise ValueError('mAP drop limits must be between 0 and 1')
-    if args.split == args.verify_split:
+    if args.integer_conv and (args.skip_map_check or args.max_class_map_drop > .01):
+        raise ValueError('--integer-conv requires full validation and a per-class loss limit of at most 0.01')
+    if calibrate and args.split == args.verify_split:
         raise ValueError('Calibration and verification splits must differ; use --split train --verify-split val')
     model_path = Path(args.model)
+    if model_path.suffix.lower() != '.pt':
+        raise ValueError('--model must be a .pt checkpoint')
+    checkpoint_sha256 = sha256(model_path)
     data_yaml = Path(args.data)
+    cuda_available = torch.cuda.is_available()
+    device = ('0' if cuda_available and not args.integer_conv else 'cpu') if args.device == 'auto' else args.device
+    providers = ['CPUExecutionProvider']
+    if device != 'cpu' and cuda_available and 'CUDAExecutionProvider' in ort.get_available_providers():
+        providers.insert(0, 'CUDAExecutionProvider')
     imgsz = resolve_export_imgsz(model_path, args.imgsz)
     fp32_path = export_fp32_onnx(
         model_path,
@@ -611,17 +772,18 @@ def main() -> None:
         simplify=not args.no_simplify,
         force=args.force_fp32_export,
     )
-    int8_path = Path(args.output) if args.output else fp32_path.with_name(f"{fp32_path.stem}_int8.onnx")
+    output_suffix = '_int8.onnx' if args.weight_activation else '_int8_compact.onnx'
+    if args.integer_conv:
+        output_suffix = '_int8_conv.onnx'
+    int8_path = Path(args.output) if args.output else fp32_path.with_name(fp32_path.stem + output_suffix)
     if int8_path.resolve() in {model_path.resolve(), fp32_path.resolve()}:
         raise ValueError('INT8 output must differ from the source checkpoint and FP32 ONNX')
     int8_path.parent.mkdir(parents=True, exist_ok=True)
 
-    calibration_images = choose_calibration_images(
-        data_yaml=data_yaml,
-        split=args.split,
-        count=args.calib_images,
-        seed=args.seed,
-    )
+    calibration_images = []
+    if calibrate:
+        calibration_images = choose_calibration_images(data_yaml, args.split, args.calib_images, args.seed)
+        print(f"Using {len(calibration_images)} calibration images from {data_yaml} split={args.split!r}")
     verification_images = choose_verification_images(
         data_yaml=data_yaml,
         split=args.verify_split,
@@ -629,70 +791,100 @@ def main() -> None:
         count=args.verify_images,
         seed=args.seed,
     )
-    print(f"Using {len(calibration_images)} calibration images from {data_yaml} split={args.split!r}")
     print(f"Using {len(verification_images)} independent images for the INT8 quality gate")
     validation_paths = resolve_split_paths(data_yaml, args.verify_split)
     if set(calibration_images).intersection(validation_paths):
         raise ValueError('Calibration and validation contain overlapping image paths')
-    device = ('0' if torch.cuda.is_available() else 'cpu') if args.device == 'auto' else args.device
-    providers = ['CPUExecutionProvider']
-    if device != 'cpu' and torch.cuda.is_available() and 'CUDAExecutionProvider' in ort.get_available_providers():
-        providers.insert(0, 'CUDAExecutionProvider')
+    calibration_providers = ['CPUExecutionProvider'] if args.integer_conv else providers
+    inference_providers = providers
+    if args.integer_conv and 'CUDAExecutionProvider' in providers:
+        inference_providers = [('CUDAExecutionProvider', {'device_id': int(device.removeprefix('cuda:'))}),
+                               'CPUExecutionProvider']
+    print(f"Validation device: {device}; ONNX providers: {', '.join(providers)}")
     report = {
-        'checkpoint': str(model_path.resolve()), 'checkpoint_sha256': sha256(model_path),
-        'fp32_sha256': sha256(fp32_path), 'imgsz': imgsz, 'rect': False,
-        'batch': 1, 'half': False, 'calibration_split': args.split,
-        'calibration_images': [str(p) for p in calibration_images],
+        'checkpoint': str(model_path.resolve()), 'checkpoint_sha256': checkpoint_sha256,
+        'fp32_sha256': sha256(fp32_path), 'imgsz': imgsz, **VALIDATION_SETTINGS,
+        'data_yaml': str(data_yaml.resolve()), 'data_yaml_sha256': sha256(data_yaml),
         'validation_split': args.verify_split, 'validation_images': len(validation_paths),
         'validation_manifest_sha256': hashlib.sha256('\n'.join(map(str, validation_paths)).encode()).hexdigest(),
-        'fp32_modules': args.fp32_modules, 'activation_type': args.activation_type,
-        'calibration_method': 'MinMax', 'per_channel': True,
-        'accuracy_verified': False, 'device': device,
+        'weight_type': 's8', 'accuracy_verified': False, 'device': device, 'onnx_providers': providers,
+        'accuracy_reference': 'pt',
         'max_map_drop': args.max_map_drop, 'max_class_map_drop': args.max_class_map_drop,
     }
 
-    candidate_path = int8_path.with_name(f".{int8_path.stem}.candidate{int8_path.suffix}")
-    candidate_path.unlink(missing_ok=True)
     try:
-        quantize_conv_only(
-            fp32_path=fp32_path,
-            int8_path=candidate_path,
-            calibration_images=calibration_images,
-            imgsz=imgsz,
-            quant_format=args.quant_format,
-            activation_type=args.activation_type,
-            quantize_detect_head=args.quantize_detect_head,
-            fp32_modules=tuple(args.fp32_modules),
-            calibration_providers=providers,
-        )
+        with tempfile.TemporaryDirectory(prefix='.int8_export_', dir=int8_path.parent) as workdir:
+            project = Path(workdir)
+            candidate_path = project / int8_path.name
+            if calibrate:
+                report.update(
+                    quantization_strategy='weight-activation', activation_type=args.activation_type,
+                    quant_format=args.quant_format, quantize_detect_head=args.quantize_detect_head,
+                    fp32_modules=args.fp32_modules, calibration_method='MinMax', per_channel=True,
+                    calibration_split=args.split, calibration_providers=calibration_providers,
+                    calibration_images=[str(p) for p in calibration_images],
+                )
+                calibrated_path = project / 'calibrated.onnx' if args.integer_conv else candidate_path
+                quantize_conv_only(
+                    fp32_path, calibrated_path, calibration_images, imgsz,
+                    args.quant_format, args.activation_type, args.quantize_detect_head,
+                    fp32_modules=tuple(args.fp32_modules), calibration_providers=calibration_providers,
+                )
+                if args.integer_conv:
+                    report.update(quantization_strategy='compact-integer-conv',
+                                  weight_group_size=COMPACT_WEIGHT_GROUP_SIZE, max_model_bytes=COMPACT_MAX_BYTES)
+                    report['compact_fp32_conv_weight_count'] = quantize_compact_weights(
+                        calibrated_path, candidate_path, fold_on_load=True,
+                    )
+            else:
+                report.update(
+                    quantization_strategy='compact-weight-only', activation_type='fp32',
+                    weight_group_size=COMPACT_WEIGHT_GROUP_SIZE, max_model_bytes=COMPACT_MAX_BYTES,
+                )
+                report['quantized_weight_count'] = quantize_compact_weights(fp32_path, candidate_path)
+            report['model_bytes'] = candidate_path.stat().st_size
+            if not args.weight_activation:
+                print(f"Compact ONNX size: {report['model_bytes']:,} bytes")
+                if report['model_bytes'] >= COMPACT_MAX_BYTES:
+                    raise RuntimeError(f"Compact ONNX must be smaller than {COMPACT_MAX_BYTES:,} bytes")
 
-        score_max, nonzero_scores, output_shape = smoke_test(candidate_path, verification_images[0], imgsz)
-        print(f"Smoke test output_shape={output_shape} score_max={score_max:.6g} nonzero_scores={nonzero_scores}")
-        if score_max <= 0.0 or nonzero_scores == 0:
-            raise RuntimeError("INT8 export produced zero class scores. Do not use this ONNX file.")
-        verify_end2end_quality(
-            fp32_path=fp32_path,
-            int8_path=candidate_path,
-            image_paths=verification_images,
-            imgsz=imgsz,
-            conf=args.verify_conf,
-            min_match_recall=args.min_match_recall,
-            providers=providers,
-        )
-        if not args.skip_map_check:
-            with tempfile.TemporaryDirectory(prefix='int8_validation_') as workdir:
-                project = Path(workdir)
-                reference = validate_map(fp32_path, data_yaml, args.verify_split, imgsz, device, project)
+            if args.integer_conv:
+                report['integer_runtime_profile'] = profile_integer_convolutions(
+                    candidate_path, verification_images[0], imgsz, inference_providers,
+                )
+            score_max, nonzero_scores, output_shape = smoke_test(candidate_path, verification_images[0], imgsz)
+            print(f"Smoke test output_shape={output_shape} score_max={score_max:.6g} nonzero_scores={nonzero_scores}")
+            if score_max <= 0.0 or nonzero_scores == 0:
+                raise RuntimeError("INT8 export produced zero class scores. Do not use this ONNX file.")
+            verify_end2end_quality(
+                fp32_path=fp32_path,
+                int8_path=candidate_path,
+                image_paths=verification_images,
+                imgsz=imgsz,
+                conf=args.verify_conf,
+                min_match_recall=args.min_match_recall,
+                providers=inference_providers,
+            )
+            if not args.skip_map_check:
+                if args.reference_report:
+                    reference = load_pt_reference(args.reference_report, report)
+                    report['pt_reference_report'] = str(args.reference_report.resolve())
+                    report['pt_reference_report_sha256'] = sha256(args.reference_report)
+                else:
+                    reference = validate_map(model_path, data_yaml, args.verify_split, imgsz, device, project)
+                report['pt_metrics'] = reference
                 candidate = validate_map(candidate_path, data_yaml, args.verify_split, imgsz, device, project)
-            report.update(fp32_metrics=reference, int8_metrics=candidate)
-            report['map_drop'] = check_map_drop(reference, candidate, args.max_map_drop, args.max_class_map_drop)
-            report['accuracy_verified'] = True
-        report['int8_sha256'] = sha256(candidate_path)
-        candidate_path.replace(int8_path)
+                report['int8_metrics'] = candidate
+                report['map_drop'] = check_map_drop(reference, candidate, args.max_map_drop, args.max_class_map_drop,
+                                                    loss_only=args.integer_conv)
+                report['accuracy_verified'] = True
+            if sha256(model_path) != checkpoint_sha256:
+                raise RuntimeError('Checkpoint changed during export; rerun with a stable checkpoint')
+            report['int8_sha256'] = sha256(candidate_path)
+            candidate_path.replace(int8_path)
     except Exception as error:
         report['error'] = str(error)
         int8_path.with_suffix('.rejected.accuracy.json').write_text(json.dumps(report, indent=2))
-        candidate_path.unlink(missing_ok=True)
         raise
     int8_path.with_suffix('.accuracy.json').write_text(json.dumps(report, indent=2))
 

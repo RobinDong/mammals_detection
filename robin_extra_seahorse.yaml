@@ -1,15 +1,19 @@
-# Original eight-class dataset plus the reviewed seahorse supplement.
+# Original eight-class dataset plus reviewed seahorse and hard-bird supplements.
 # Seahorses retain class 5 (fish). New split ratio: train/test/valid = 80/10/10.
+# Hard birds retain class 1 (bird), with train/val/test = 80/10/10.
 path: /data
 train:
   - /data/coco_extra/train2017.txt
   - /data/seahorse/train.txt
+  - /data/hard_bird_detection/train.txt
 val:
   - /data/coco_extra/val2017.txt
   - /data/seahorse/valid.txt
+  - /data/hard_bird_detection/val.txt
 test:
   - /data/coco_extra/test-dev2017.txt
   - /data/seahorse/test.txt
+  - /data/hard_bird_detection/test.txt
 nc: 8
 names:
   0: person

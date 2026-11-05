@@ -4,7 +4,7 @@ import onnx
 from ultralytics import YOLO
 
 
-MODEL_PATH = Path("runs/detect/yolo26l_finetune_texture_v2-2/weights/best_int8.onnx")
+MODEL_PATH = Path("runs/detect/yolo26l_finetune_texture_v2-11/weights/best_int8_compact.onnx")
 
 
 def resolve_validation_imgsz(model_path: Path, model: YOLO) -> int:
